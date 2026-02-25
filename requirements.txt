@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch
+torchvision
+torchaudio
+psutil
+gradio
+gguf
+sentencepiece
+safetensors
+numpy

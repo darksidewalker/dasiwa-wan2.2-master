@@ -1,0 +1,35 @@
+# --- Application Folders ---
+models/
+recipes/*.json
+# EXCEPT the example template
+!recipes/example.json
+logs/
+session_recipe.json
+
+# --- Custom Build / Llama.cpp ---
+llama.cpp/
+build/
+bin/
+*.gguf
+*.patch
+!lcpp.patch
+
+# --- RAMDisk & Temp ---
+/mnt/ramdisk/
+temp/
+tmp/
+
+# --- Python & Environment ---
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.uv/
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

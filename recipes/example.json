@@ -1,0 +1,68 @@
+{
+  "paths": {
+    "base_model": "models/MODEL.safetensors",
+    "lora_dir": "PATH_TO_YOUR_LORAS",
+    "output_prefix": "models/MODEL_OUT.safetensors",
+    "global_weight_factor": 0.92,
+    "save_interval": 0
+  },
+  "pipeline": [
+    {
+      "pass_name": "Engine",
+      "description": "Engine Integration",
+      "density": 1.0,
+      "block_shield": false,
+      "features": [
+        {
+          "file": "distilled-lora.safetensors",
+          "weight": 1.6,
+          "modify_skeleton": true
+        },
+        {
+          "file": "any-engine-lora.safetensors",
+          "weight": 1.0,
+          "modify_skeleton": true
+        }
+      ]
+    },
+    {
+      "pass_name": "Physics",
+      "description": "Stability Pass",
+      "density": 0.95,
+      "block_shield": false,
+      "features": [
+        {
+          "file": "any-stabilit-lora.safetensors",
+          "weight": 0.5,
+          "modify_skeleton": true
+        }
+      ]
+    },
+    {
+      "pass_name": "Motion",
+      "description": "Motion Pass",
+      "density": 0.95,
+      "block_shield": false,
+      "features": [
+        {
+          "file": "any-motion-lora.safetensors",
+          "weight": 0.5,
+          "modify_skeleton": true
+        }
+      ]
+    },
+    {
+      "pass_name": "Aesthetic",
+      "description": "Aeathetics Pass",
+      "density": 0.95,
+      "block_shield": false,
+      "features": [
+        {
+          "file": "any-visual-lora.safetensors",
+          "weight": 0.5,
+          "modify_skeleton": true
+        }
+      ]
+    }
+  ]
+}
