@@ -32,65 +32,43 @@ class ActionMasterEngine:
         print(f"🧬 Wan 2.2 Mode: {'HIGH' if self.is_high_res else 'LOW'} Noise Variant detected.")
 
     def clean_k(self, k):
-            """Standardizes Wan 2.2 keys to match base model architecture."""
-            # 1. Strip LoRA suffixes
-            k = re.sub(r'\.(lora_up|lora_down|alpha|lora_A|lora_B|default).*', '', k)
-            
-            # 2. Normalize common training prefixes
-            k = k.replace("lora_unet_", "")
-            k = k.replace("diffusion_model.", "")
-            k = k.replace("transformer.", "")
-            
-            # 3. CRITICAL: Convert underscores to dots ONLY for block structures
-            # This turns 'blocks_4_cross_attn_o' -> 'blocks.4.cross_attn.o'
-            if "blocks_" in k:
-                k = k.replace("blocks_", "blocks.")
-                # Replace remaining underscores with dots
-                k = k.replace("_", ".")
-                
-            # 4. Clean up any double dots created by the replacement
-            k = k.replace("__", ".").strip(".")
-            
-            return k
-
-    def is_skeletal(self, key):
-        """Identifies if a key belongs to the structural core (Blocks 0-8)."""
-        match = re.search(r'blocks?\.(\d+)\.', key)
-        return match and int(match.group(1)) <= 8
+        """Refined for Wan 2.2: Maps LoRA dots to Base underscores."""
+        # 1. Strip LoRA suffixes
+        k = re.sub(r'\.(lora_up|lora_down|alpha|lora_A|lora_B|default).*', '', k)
+        
+        # 2. Strip common training prefixes
+        k = k.replace("lora_unet.", "").replace("diffusion_model.", "").replace("transformer.", "")
+        
+        # 3. CRITICAL FIX: Base model uses 'cross_attn' and 'self_attn' (underscores)
+        # We replace dots with underscores specifically for the attention parts
+        k = k.replace("cross.attn", "cross_attn")
+        k = k.replace("self.attn", "self_attn")
+        k = k.replace("norm.k", "norm_k")
+        k = k.replace("norm.q", "norm_q")
+        
+        # 4. Standardize blocks (handle blocks_4 -> blocks.4)
+        if "blocks_" in k:
+            k = k.replace("blocks_", "blocks.")
+        
+        # 5. Handle any remaining underscores that should be dots in blocks
+        # e.g., blocks.1_attn -> blocks.1.attn
+        k = k.replace("__", ".")
+        
+        return k.strip(".")
 
     def process_pass(self, step, global_mult):
-        conflict_log = []
-        use_shield = step.get('block_shield', False)
-        noise_dampener = 1.0 if self.is_high_res else 0.85
-        density = step.get('density', 0.6)
-        
-        styles = step.get('styles', [])
-        if not styles:
-            return []
-
-        # Load all LoRAs for this pass
-        style_dicts = []
-        for s in styles:
-            l_path = os.path.join(self.paths['lora_dir'], s['file'])
-            if os.path.exists(l_path):
-                style_dicts.append(load_file(l_path))
-            else:
-                print(f"⚠️ LoRA not found: {s['file']}")
-
-        # Aggregate all unique keys across these LoRAs
-        all_cores = set().union(*(set(self.clean_k(k) for k in sd.keys()) for sd in style_dicts))
-
+        # ... (keep existing setup code) ...
         for core in all_cores:
-            # Try 1: Direct Match (most efficient)
+            # Match strictly from the end to avoid prefix confusion
+            # Search for 'blocks.X.layer.weight'
             target_key = next((bk for bk in self.base_keys if core in bk and bk.endswith(".weight")), None)
-            
-            # Try 2: Deep Match (if core is a partial path)
-            if not target_key:
-                # Remove prefixes from base keys to see if they match core
-                target_key = next((bk for bk in self.base_keys if bk.endswith(f"{core}.weight")), None)
 
             if not target_key:
-                # Still logging missed keys so we can refine further if needed
+                # One last fallback: try replacing dots with underscores in the core
+                fuzzy_core = core.replace(".", "_").replace("blocks_", "blocks.")
+                target_key = next((bk for bk in self.base_keys if fuzzy_core in bk and bk.endswith(".weight")), None)
+
+            if not target_key:
                 if "blocks" in core:
                     print(f"❓ Still missed: {core}")
                 continue

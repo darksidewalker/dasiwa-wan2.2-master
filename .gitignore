@@ -1,6 +1,7 @@
 # --- Application Folders ---
-models/
+models/**
 recipes/*.json
+models
 # EXCEPT the example template
 !recipes/example.json
 logs/
