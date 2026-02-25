@@ -42,7 +42,7 @@ def clear_ramdisk():
 def move_rd_to_ssd():
     if not os.path.exists(RAMDISK_PATH): return "❌ RAMDisk not found."
     moved = []
-    # Scans for both GGUF and Safetensors (FP8/NV4)
+    # Now scans for both GGUF and Safetensors (FP8/NV4)
     valid_exts = (".gguf", ".safetensors")
     for f in os.listdir(RAMDISK_PATH):
         if f.endswith(valid_exts):
@@ -100,13 +100,19 @@ def run_merge_pipeline(editor_content, model_filename, progress=gr.Progress()):
 
         for i, step in enumerate(engine.recipe['pipeline']):
             progress((i/len(engine.recipe['pipeline'])), desc=f"Merging Pass {i+1}...")
-            engine.process_pass(step, engine.paths.get('global_weight_factor', 1.0))
+
+            # Run the pass and get conflicts
+            conflicts = engine.process_pass(step, engine.paths.get('global_weight_factor', 1.0))
+
+            # Get the heatmap data for this specific pass
+            heatmap_report = engine.get_heatmap_stats(conflicts)
+
             logs.append(f"✅ Pass {i+1} complete.")
+            logs.append(heatmap_report) # This puts it in the GUI!
+            logs.append("-" * 30)
 
         final_file = engine.save()
         return "\n".join(logs) + f"\n\n✨ SAVED: {final_file}"
-    except Exception as e:
-        return f"❌ Merger Error: {str(e)}"
 
 # --- Quantizer Logic ---
 def run_unified_quantization(model_filename, quant_choice, keep_in_ram, progress=gr.Progress()):
@@ -192,6 +198,7 @@ def run_fp_quantization(model_filename, format_choice, use_wan_preset, keep_in_r
             cmd.append("--nvfp4")
         elif format_choice == "mxfp8":
             cmd.append("--mxfp8")
+        # Note: We REMOVED the else/--fp8 block because FP8 is the default!
 
         # Add the specific WAN handling
         if use_wan_preset:
@@ -298,12 +305,12 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     q_refresh.click(lambda: gr.update(choices=get_model_list()), outputs=q_model_selector)
     run_q_btn.click(run_unified_quantization, inputs=[q_model_selector, q_type, keep_ram_toggle], outputs=[q_output])
 
-    # 3. FP Quantizer Events
+    # 3. FP Quantizer Events (The Fix)
     fp_refresh.click(lambda: gr.update(choices=get_model_list()), outputs=fp_model_selector)
     run_fp_btn.click(
         run_fp_quantization,
         inputs=[fp_model_selector, fp_format, wan_preset, keep_ram_toggle_fp],
-        outputs=[fp_output]
+        outputs=[fp_output]  # <--- Ensure this matches the variable name in Tab 3
     )
 
     # 4. Utilities
