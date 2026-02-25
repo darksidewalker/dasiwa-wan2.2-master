@@ -114,7 +114,6 @@ def run_merge_pipeline(editor_content, model_filename, progress=gr.Progress()):
         final_file = engine.save()
         return "\n".join(logs) + f"\n\n✨ SAVED: {final_file}"
 
-    # THIS WAS MISSING:
     except Exception as e:
         return f"❌ Merge Error: {str(e)}"
 

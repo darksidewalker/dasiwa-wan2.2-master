@@ -73,6 +73,30 @@ class ActionMasterEngine:
         gc.collect()
         return conflict_log
 
+    def get_heatmap_stats(self, conflicts):
+        import re
+        early, mid, late = 0, 0, 0
+        for c in conflicts:
+            # Matches 'blocks.0.', 'blocks.1.', etc.
+            match = re.search(r'blocks\.(\d+)\.', c)
+            if match:
+                blk = int(match.group(1))
+                if blk <= 8: early += 1
+                elif 9 <= blk <= 30: mid += 1
+                else: late += 1
+
+        report = [
+            f"📊 PASS REPORT",
+            f"  🔹 [Structure] Blocks 0-8:   {early:3} clashes",
+            f"  🟢 [Motion]    Blocks 9-30:  {mid:3} clashes",
+            f"  🟡 [Aesthetic] Blocks 31-40: {late:3} clashes"
+        ]
+        
+        if early > 25:
+            report.append("  ⚠️ CRITICAL: Skeletal instability detected!")
+        
+        return "\n".join(report)
+
     def clean_k(self, k):
         return re.sub(r'.lora_(down|up|A|B|default).*', '', k).replace("__", ".").replace("lora_unet.", "").replace("blocks_", "blocks.")
 

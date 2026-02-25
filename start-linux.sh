@@ -20,66 +20,46 @@ else
     sudo mount -t tmpfs -o size=$RAMDISK_SIZE,mode=1777 tmpfs "$RAMDISK_PATH"
 fi
 
-# --- 3. CLONE & PATCH LLAMA.CPP ---
-if [ ! -d "$LLAMA_DIR" ]; then
-    echo "📥 Cloning llama.cpp..."
-    git clone https://github.com/ggerganov/llama.cpp "$LLAMA_DIR"
-fi
+# --- 3 & 4. CLONE, PATCH & BUILD LLAMA.CPP (SKIP IF DONE) ---
+cd "$PROJECT_DIR"
 
-cd "$PROJECT_DIR" # Ensure we are in the root to find the patch
+# Define the path to the final binary we need
+QUANT_EXE="$LLAMA_DIR/build/bin/llama-quantize"
 
-# 1. Fix line endings on the patch file IF it exists
-if [ -f "lcpp.patch" ]; then
-    echo "🧹 Normalizing lcpp.patch line endings..."
-    python3 -c "
-import os
-f = 'lcpp.patch'
-with open(f, 'rb') as fh:
-    content = fh.read().replace(b'\r\n', b'\n')
-with open(f, 'wb') as fh:
-    fh.write(content)
-"
-
-    # 2. Now try to apply it to the cloned repo
-    cd "$LLAMA_DIR"
-    git checkout tags/b3962 -f
-
-    if git apply --check "../lcpp.patch" > /dev/null 2>&1; then
-        echo "🔧 Applying lcpp.patch..."
-        git apply "../lcpp.patch"
-        rm -rf build # Force recompile
-    else
-        echo "✅ Patch already applied or already normalized."
-    fi
+if [ -f "$QUANT_EXE" ]; then
+    echo "✅ Patched llama-quantize found. Skipping patch/build steps."
 else
-    echo "⚠️ lcpp.patch NOT FOUND. You must provide this file for WAN 2.2 support."
-fi
+    echo "🔨 Binary not found or incomplete. Starting build process..."
 
-# --- 4. BUILD BINARIES (Optimized for 40/50-Series) ---
-# We check for the specific quantizer binary
-if [ ! -f "$LLAMA_DIR/build/bin/llama-quantize" ]; then
-    echo "🔨 Building llama.cpp with CUDA + C++17 support..."
+    # 1. Clone if missing
+    if [ ! -d "$LLAMA_DIR" ]; then
+        git clone https://github.com/ggerganov/llama.cpp "$LLAMA_DIR"
+    fi
+
     cd "$LLAMA_DIR"
-    mkdir -p build && cd build
+    
+    # 2. Hard Reset and Patch (Only if we are actually building)
+    echo "🏷️ Preparing source for Wan 2.2..."
+    git reset --hard
+    git checkout tags/b3962 -f
+    
+    if [ -f "$PROJECT_DIR/lcpp.patch" ]; then
+        echo "🧹 Normalizing and Applying patch..."
+        # Fix line endings on the fly
+        python3 -c "f=open('$PROJECT_DIR/lcpp.patch','rb');c=f.read().replace(b'\r\n',b'\n');open('$PROJECT_DIR/lcpp.patch','wb').write(c)"
+        git apply "$PROJECT_DIR/lcpp.patch"
+    fi
 
-    # Force C++17 to satisfy modern CUDA (CCCL) requirements
+    # 3. Build with your modern CUDA + C++17 flags
+    mkdir -p build && cd build
     cmake .. -DGGML_CUDA=ON \
              -DCMAKE_CUDA_ARCHITECTURES=native \
              -DCMAKE_CXX_STANDARD=17 \
              -DCMAKE_CUDA_STANDARD=17
-
+             
     cmake --build . --config Release -j$(nproc)
-
-    # Check if build actually succeeded
-    if [ -f "bin/llama-quantize" ]; then
-        echo "✅ Build complete and verified."
-    else
-        echo "❌ Build FAILED. Check the logs above for C++ or CUDA errors."
-        exit 1
-    fi
+    
     cd "$PROJECT_DIR"
-else
-    echo "✅ Patched binaries already exist. Skipping build to save time."
 fi
 
 # --- 5. LOCAL VENV SETUP ---
