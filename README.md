@@ -4,7 +4,7 @@
 
 ## ✨ Key Features
 
-🧬 Model Merger: Advanced JSON-based merging using the ActionMasterEngine. Supports multi-pass pipelines and custom recipe loading.
+🧬 Model Merger: Advanced JSON-based merging using the Master-Engine. Supports multi-pass pipelines and custom recipe loading.
 
 📦 GGUF Quantizer: Specialized WAN 2.2 quantization with Self-Healing 5D logic to preserve video tensor shapes.
 
