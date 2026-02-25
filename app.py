@@ -108,14 +108,19 @@ def run_merge_pipeline(editor_content, model_filename, progress=gr.Progress()):
             heatmap_report = engine.get_heatmap_stats(conflicts)
 
             logs.append(f"✅ Pass {i+1} complete.")
-            logs.append(heatmap_report) # This puts it in the GUI!
+            logs.append(heatmap_report) 
             logs.append("-" * 30)
 
         final_file = engine.save()
         return "\n".join(logs) + f"\n\n✨ SAVED: {final_file}"
 
+    # THIS WAS MISSING:
+    except Exception as e:
+        return f"❌ Merge Error: {str(e)}"
+
 # --- Quantizer Logic ---
 def run_unified_quantization(model_filename, quant_choice, keep_in_ram, progress=gr.Progress()):
+    # ... rest of your code ...
     logs = []
     five_d_counter = 0
     try:

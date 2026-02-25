@@ -22,35 +22,64 @@ fi
 
 # --- 3. CLONE & PATCH LLAMA.CPP ---
 if [ ! -d "$LLAMA_DIR" ]; then
-    echo "📥 Cloning llama.cpp (Tag b3962)..."
-    git clone --branch b3962 https://github.com/ggerganov/llama.cpp "$LLAMA_DIR"
+    echo "📥 Cloning llama.cpp..."
+    git clone https://github.com/ggerganov/llama.cpp "$LLAMA_DIR"
 fi
 
-# Apply the patch if it exists and hasn't been applied yet
-if [ -f "$PATCH_FILE" ]; then
+cd "$PROJECT_DIR" # Ensure we are in the root to find the patch
+
+# 1. Fix line endings on the patch file IF it exists
+if [ -f "lcpp.patch" ]; then
+    echo "🧹 Normalizing lcpp.patch line endings..."
+    python3 -c "
+import os
+f = 'lcpp.patch'
+with open(f, 'rb') as fh:
+    content = fh.read().replace(b'\r\n', b'\n')
+with open(f, 'wb') as fh:
+    fh.write(content)
+"
+
+    # 2. Now try to apply it to the cloned repo
     cd "$LLAMA_DIR"
-    if patch -p1 --dry-run < "$PATCH_FILE" > /dev/null 2>&1; then
+    git checkout tags/b3962 -f
+
+    if git apply --check "../lcpp.patch" > /dev/null 2>&1; then
         echo "🔧 Applying lcpp.patch..."
-        patch -p1 < "$PATCH_FILE"
+        git apply "../lcpp.patch"
+        rm -rf build # Force recompile
     else
-        echo "✅ Patch already applied or incompatible."
+        echo "✅ Patch already applied or already normalized."
+    fi
+else
+    echo "⚠️ lcpp.patch NOT FOUND. You must provide this file for WAN 2.2 support."
+fi
+
+# --- 4. BUILD BINARIES (Optimized for 40/50-Series) ---
+# We check for the specific quantizer binary
+if [ ! -f "$LLAMA_DIR/build/bin/llama-quantize" ]; then
+    echo "🔨 Building llama.cpp with CUDA + C++17 support..."
+    cd "$LLAMA_DIR"
+    mkdir -p build && cd build
+
+    # Force C++17 to satisfy modern CUDA (CCCL) requirements
+    cmake .. -DGGML_CUDA=ON \
+             -DCMAKE_CUDA_ARCHITECTURES=native \
+             -DCMAKE_CXX_STANDARD=17 \
+             -DCMAKE_CUDA_STANDARD=17
+
+    cmake --build . --config Release -j$(nproc)
+
+    # Check if build actually succeeded
+    if [ -f "bin/llama-quantize" ]; then
+        echo "✅ Build complete and verified."
+    else
+        echo "❌ Build FAILED. Check the logs above for C++ or CUDA errors."
+        exit 1
     fi
     cd "$PROJECT_DIR"
 else
-    echo "⚠️ lcpp.patch not found in $PROJECT_DIR. Skipping patch step."
-fi
-
-# --- 4. BUILD BINARIES ---
-if [ ! -f "$LLAMA_DIR/build/bin/llama-quantize" ]; then
-    echo "🔨 Building llama.cpp with CUDA support..."
-    cd "$LLAMA_DIR"
-    mkdir -p build && cd build
-    cmake .. -DGGML_CUDA=ON
-    cmake --build . --config Release -j$(nproc)
-    cd "$PROJECT_DIR"
-    echo "✅ Build complete."
-else
-    echo "✅ Binaries already exist. Skipping build."
+    echo "✅ Patched binaries already exist. Skipping build to save time."
 fi
 
 # --- 5. LOCAL VENV SETUP ---
