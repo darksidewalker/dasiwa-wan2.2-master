@@ -20,7 +20,7 @@ LOGS_DIR = "logs"
 for d in [MODELS_DIR, RECIPES_DIR, LOGS_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# --- 2. THE TERMINAL & VITALS STYLE (EXTENDED) ---
+# --- 2. STYLING & SCRIPTS ---
 CSS_STYLE = """
 #terminal textarea { 
     background-color: #0d1117 !important; 
@@ -59,12 +59,15 @@ CSS_STYLE = """
 
 JS_AUTO_SCROLL = """
 () => {
-    const textarea = document.querySelector('#terminal textarea');
-    if (textarea) { textarea.scrollTop = textarea.scrollHeight; }
+    // Target the specific textarea inside the terminal box
+    const el = document.querySelector('#terminal textarea');
+    if (el) {
+        el.scrollTop = el.scrollHeight;
+    }
 }
 """
 
-# --- 3. CORE UTILITIES ---
+# --- 3. UTILITIES ---
 
 def get_sys_info():
     ram = psutil.virtual_memory().percent
@@ -107,11 +110,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "-"*60 + "\n"
     
     try:
-        if not base_model or not recipe_name:
-            raise ValueError("Execution halted: Base model or Recipe name missing.")
-
         # STAGE 1: PARSING
-        progress(0.05, desc="🧬 Parsing Recipe...")
         clean_json = re.sub(r'//.*', '', recipe_json)
         recipe_dict = json.loads(clean_json)
         recipe_dict['paths'] = recipe_dict.get('paths', {})
@@ -125,11 +124,10 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         model_slug = os.path.splitext(base_model)[0][:12]
         recipe_slug = recipe_name.replace(".json", "")
         
-        # Define the specific filename for this session
+        # Define cache path
         cache_name = f"cache_{model_slug}_{recipe_slug}_{'flattened' if is_gguf else 'native'}.safetensors"
         temp_path = os.path.join(MODELS_DIR, cache_name)
 
-        # CHECK FOR CACHE
         if os.path.exists(temp_path):
             log_acc += f"♻️ CACHE HIT: Found intermediate at {temp_path}\n"
             log_acc += "⏭️ SKIPPING MERGE: Proceeding to Quantization.\n"
@@ -146,24 +144,19 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
 
             # STAGE 3: DATA PREPARATION
             progress(0.8, desc="📐 Preparing Tensors...")
-            log_acc += "-"*60 + "\n"
-            
-            # FIX: We manually set the engine's internal save path before calling save
-            # This avoids the 'unexpected keyword argument' error
             if is_gguf:
                 log_acc += f"📐 GGUF DETECTED: Flattening to {cache_name}...\n"
-                # We assume the engine saves to a default location, then we rename it
-                raw_output = engine.save_and_patch(use_ramdisk=False)
-                os.rename(raw_output, temp_path)
+                raw_out = engine.save_and_patch(use_ramdisk=False)
+                os.rename(raw_out, temp_path)
             else:
                 log_acc += f"💎 FP8 DETECTED: Saving Native 5D to {cache_name}...\n"
-                raw_output = engine.save_pure_5d(use_ramdisk=False)
-                os.rename(raw_output, temp_path)
+                raw_out = engine.save_pure_5d(use_ramdisk=False)
+                os.rename(raw_out, temp_path)
             
             log_acc += f"✅ INTERMEDIATE SAVED: {temp_path}\n"
             yield log_acc, temp_path
 
-        # STAGE 4: QUANTIZATION CLI
+        # STAGE 4: QUANTIZATION
         progress(0.9, desc=f"🏗️ Conversion: {q_format}...")
         out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Output')
         
@@ -177,9 +170,8 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             cmd = ["convert_to_quant", "-i", temp_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
 
         log_acc += f"🖥️ CLI EXEC: {' '.join(cmd)}\n"
-        yield log_acc, temp_path
-
-        # MONITORING
+        
+        # PROCESS MONITORING
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in process.stdout:
             log_acc += f"  [QUANT] {line}"
@@ -188,10 +180,10 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         process.wait()
 
         if process.returncode == 0:
-            log_acc += f"\n✨ SUCCESS: Model created at {final_output_path}\n"
+            log_acc += f"✅ SUCCESS: {final_output_path}\n"
             log_acc += f"💾 CACHE PRESERVED: {temp_path}\n"
         else:
-            log_acc += f"\n❌ ERROR: Quantization failed (Code {process.returncode}).\n"
+            log_acc += f"❌ FAILED (Code {process.returncode})\n"
 
         if auto_move and os.path.exists(final_output_path):
             log_acc += f"{sync_ram_to_ssd(final_output_path)}\n"
@@ -220,11 +212,21 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
                 base_dd = gr.Dropdown(label="Base Model")
                 recipe_dd = gr.Dropdown(label="Recipe (JSON)")
                 refresh_btn = gr.Button("🔄 Refresh Assets")
+            
             with gr.Group():
                 gr.Markdown("### 💎 Quantization Target")
-                quant_select = gr.Dropdown(choices=["fp8", "nvfp4", "GGUF_Q8_0", "GGUF_Q5_K_M", "GGUF_Q4_K_M"], value="fp8", label="Target Format")
+                quant_select = gr.Dropdown(
+                    choices=[
+                        "fp8", "nvfp4", "int8",
+                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q5_K_M", 
+                        "GGUF_Q4_K_M", "GGUF_Q3_K_L", "GGUF_Q2_K"
+                    ], 
+                    value="fp8", 
+                    label="Target Format"
+                )
                 auto_move_toggle = gr.Checkbox(label="🚀 Auto-move to SSD on finish", value=False)
                 start_btn = gr.Button("🔥 START PIPELINE", variant="primary")
+            
             with gr.Group(elem_classes=["sync-box"]):
                 gr.Markdown("### 📦 SSD Synchronization")
                 last_path_state = gr.State("")
@@ -238,18 +240,22 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
                 with gr.Tab("📝 Recipe Editor"):
                     recipe_editor = gr.Code(label="JSON Configuration", language="json", lines=25)
 
-    # EVENT BINDINGS
+    # --- 6. EVENT BINDINGS ---
     demo.load(list_files, outputs=[base_dd, recipe_dd])
     refresh_btn.click(list_files, outputs=[base_dd, recipe_dd])
     recipe_dd.change(load_recipe_text, inputs=[recipe_dd], outputs=[recipe_editor])
     
-    # Ensure recipe_dd is passed to run_pipeline
+    # We add every=1 to the click or use a specific trigger for the scroll
     start_btn.click(
         fn=run_pipeline, 
-        # ADD recipe_dd HERE as the 4th input
         inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], 
         outputs=[terminal_box, last_path_state],
-    ).then(fn=None, js=JS_AUTO_SCROLL)
+        show_progress="minimal"
+    )
+
+    # This specialized trigger watches the terminal_box for changes 
+    # and forces the scroll function to run every time it updates.
+    terminal_box.change(fn=None, js=JS_AUTO_SCROLL)
 
     sync_trigger.click(fn=sync_ram_to_ssd, inputs=[last_path_state], outputs=[sync_output])
 
