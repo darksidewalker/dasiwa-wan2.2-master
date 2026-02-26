@@ -48,60 +48,69 @@ class ActionMasterEngine:
                     return bk
         return None
 
-    def process_pass(self, step, global_mult):
-        conflict_log = []
-        styles = step.get('styles', [])
-        use_shield = step.get('block_shield', False)
+def process_pass(self, step, global_mult):
+        features = step.get('features', []) # Your JSON uses 'features'
+        pass_density = step.get('density', 1.0)
+        pass_name = step.get('pass_name', 'Unnamed Pass')
         
+        print(f"🚀 Processing Pass: {pass_name} (Density: {pass_density})")
+        
+        # Load all feature LoRAs for this pass
         style_dicts = []
-        for s in styles:
-            path = os.path.join(self.paths['lora_dir'], s['file'])
-            if os.path.exists(path):
-                style_dicts.append(load_file(path))
+        for f in features:
+            f_path = os.path.join(self.paths.get('lora_dir', ''), f['file'])
+            style_dicts.append(load_file(f_path))
+
+        # We iterate over the base model keys
+        for target_key in self.base_keys:
+            # Check global shield, but allow override if modify_skeleton is true in JSON
+            is_shielded = self.is_skeletal_shielded(target_key)
+            
+            deltas = []
+            for i, sd in enumerate(style_dicts):
+                # If block is shielded but LoRA says 'modify_skeleton: true', we proceed
+                if is_shielded and not features[i].get('modify_skeleton', False):
+                    continue
+                
+                # --- KEY MAPPING LOGIC ---
+                # Search for LoRA keys that match our target_key
+                # (Wan 2.2 LoRAs usually have a 'lora_up' and 'lora_down' suffix)
+                up_k, down_k = self.find_lora_keys(sd, target_key)
+                if not up_k or not down_k: continue
+
+                # Reconstruct and scale
+                w = features[i]['weight'] * global_mult
+                delta = gpu_mm(sd[up_k], sd[down_k]) * w
+                deltas.append(delta)
+
+            if not deltas: continue
+            stacked = torch.stack(deltas)
+
+            # --- UNIVERSAL SWITCH BASED ON YOUR JSON DENSITY ---
+            if pass_density >= 1.0:
+                # ADDITIVE MODE: For Engine/Brain passes
+                final_delta = stacked.sum(dim=0)
             else:
-                print(f"⚠️ LoRA missing: {path}")
+                # TIES MODE: For Physics/Behavior passes (density < 1.0)
+                # 1. Trim noise based on your JSON density
+                flat = stacked.abs()
+                threshold = torch.quantile(flat, 1 - pass_density)
+                trim_mask = (flat >= threshold).float()
+                
+                # 2. Elect Sign & Mask Conflicts
+                signs = torch.sign(stacked * trim_mask)
+                elected_sign = torch.sign(signs.sum(dim=0))
+                agreement_mask = (signs == elected_sign).float()
+                
+                # 3. Merge
+                final_delta = (stacked * trim_mask * agreement_mask).sum(dim=0) / agreement_mask.sum(dim=0).clamp(min=1)
 
-        unique_concepts = set()
-        for sd in style_dicts:
-            for k in sd.keys():
-                c = re.sub(r'\.(lora_up|lora_down|alpha|lora_A|lora_B|default).*', '', k)
-                c = c.replace("lora_unet.", "").replace("transformer.", "").replace("diffusion_model.", "")
-                unique_concepts.add(c)
+            self.apply_delta(target_key, final_delta)
 
-        for concept in unique_concepts:
-            if self.abort_requested: return "ABORTED"
-            target_key = self.get_dynamic_target(concept)
-            if not target_key: continue
-
-            if use_shield and self.is_skeletal(target_key):
-                continue 
-
-            layer_deltas = []
-            for j, sd in enumerate(style_dicts):
-                up_k = next((k for k in sd.keys() if concept in k.replace("_", ".") and (".up" in k or "_B" in k or ".lora_B" in k)), None)
-                down_k = next((k for k in sd.keys() if concept in k.replace("_", ".") and (".down" in k or "_A" in k or ".lora_A" in k)), None)
-
-                if up_k and down_k:
-                    # Pure JSON Weight logic
-                    w = styles[j]['weight'] * global_mult
-                    delta = gpu_mm(sd[up_k], sd[down_k]) * w
-                    layer_deltas.append(delta)
-
-            if len(layer_deltas) > 1:
-                stacked = torch.stack(layer_deltas)
-                signs = torch.sign(stacked)
-                dom_sign = torch.sign(signs.sum(dim=0))
-                if not torch.all(signs[0] == signs):
-                    conflict_log.append(target_key)
-                mask = (signs == dom_sign).float()
-                aligned = (stacked * mask).sum(dim=0) / (stacked != 0).sum(dim=0).clamp(min=1)
-                self.apply_delta(target_key, aligned)
-            elif len(layer_deltas) == 1:
-                self.apply_delta(target_key, layer_deltas[0])
-
+        # Cleanup RAM after pass
         del style_dicts
-        self._cleanup()
-        return conflict_log
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def is_skeletal(self, key):
         match = re.search(r'blocks?\.(\d+)\.', key.replace('_', '.'))

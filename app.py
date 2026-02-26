@@ -192,17 +192,23 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 engine.process_pass(step, 1.0)
                 yield log_acc, ""
 
-            # STAGE 3: DATA PREPARATION (SSD)
-            progress(0.8, desc="📐 Preparing Tensors...")
-            if is_gguf:
-                log_acc += f"📐 GGUF: Flattening to SSD -> {cache_name}\n"
-                raw_out = engine.save_and_patch(use_ramdisk=False)
-            else:
-                log_acc += f"💎 FP8: Saving Native 5D to SSD -> {cache_name}\n"
-                raw_out = engine.save_pure_5d(use_ramdisk=False)
+            # STAGE 3: ROBUST TENSOR PRESERVATION
+            progress(0.8, desc="📐 Preserving 5D Structure...")
             
-            os.rename(raw_out, temp_path)
-            log_acc += f"✅ INTERMEDIATE SAVED: {temp_path}\n"
+            # We avoid 'save_pure_5d' because it can strip distilled metadata.
+            # 'save_and_patch' keeps the original model's tensor indexing.
+            log_acc += f"📐 Mode: {'GGUF' if is_gguf else 'FP8'} | Preservation: Robust\n"
+            
+            # 64GB SAFETY: Save to SSD to keep RAM clear for the merging math
+            raw_out = engine.save_and_patch(use_ramdisk=False)
+            
+            # Verify the file was created before moving on
+            if os.path.exists(raw_out):
+                os.rename(raw_out, temp_path)
+                log_acc += f"✅ INTERMEDIATE VERIFIED: {temp_path}\n"
+            else:
+                raise Exception("Engine failed to export the patched model.")
+                
             yield log_acc, temp_path
         
         # Clean up VRAM/RAM before the heavy lifting    
@@ -213,29 +219,42 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
 
         # STAGE 4: QUANTIZATION (HYBRID STORAGE + LOG FILTER)
         progress(0.9, desc=f"🏗️ Conversion: {q_format}...")
+        
+        # --- PRE-QUANT MEMORY FLUSH ---
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_acc += "🧹 MEMORY: VRAM flushed for Quantization.\n"
+        yield log_acc, temp_path
+
         out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Output')
+        
+        # Determine the directory: prioritize RAMDisk if it exists
         output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
         
         if is_gguf:
             q_type = q_format.replace("GGUF_", "")
             final_name = f"{out_prefix}_{recipe_slug}_{q_type}.gguf"
-            final_output_path = os.path.join(output_dir, final_name)
-            cmd = ["python", "convert_to_gguf.py", temp_path, "--out", final_output_path, "--quant", q_type]
         else:
             final_name = f"{out_prefix}_{recipe_slug}_{q_format}.safetensors"
-            final_output_path = os.path.join(output_dir, final_name)
+            
+        # FORCE FULL PATH
+        final_output_path = os.path.abspath(os.path.join(output_dir, final_name))
+        
+        if is_gguf:
+            cmd = ["python", "convert_to_gguf.py", temp_path, "--out", final_output_path, "--quant", q_type]
+        else:
             fmt_flag = [] if q_format == "fp8" else [f"--{q_format}"]
             cmd = ["convert_to_quant", "-i", temp_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
 
         log_acc += f"🖥️ CLI EXEC: {' '.join(cmd)}\n"
-        log_acc += f"🛰️ OUTPUT TARGET: {'RAMDisk' if output_dir == RAMDISK_PATH else 'SSD'}\n"
-        log_acc += "🚀 Quantizer Started... (Filtering optimization spam)\n"
+        log_acc += f"🛰️ OUTPUT TARGET: {final_output_path}\n"
         yield log_acc, temp_path
 
-        # --- REFINED MONITORING LOOP (SYNCED TO active_process) ---
+        # --- MONITORING LOOP ---
+        global active_process
         active_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        last_log_time = time.time()
         
+        last_log_time = time.time()
         for line in active_process.stdout:
             is_spam = "worse_count" in line or "Optimizing" in line
             is_important = any(k in line for k in ["Error", "Success", "Saved", "Loading", "Finalizing"])
@@ -244,31 +263,28 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 log_acc += f"  [QUANT] {line}"
                 yield log_acc, temp_path
             else:
-                if time.time() - last_log_time > 8: # Pulse pulse every 8 seconds
-                    log_acc += "  [QUANT] ...still optimizing weights (background)...\n"
+                if time.time() - last_log_time > 8:
+                    log_acc += "  [QUANT] ...still optimizing weights...\n"
                     last_log_time = time.time()
                     yield log_acc, temp_path
         
         active_process.wait()
 
-        if active_process.returncode == 0:
-            log_acc += f"✅ SUCCESS: {final_output_path}\n"
-        elif active_process.returncode == -15:
-            log_acc += "🛑 STOPPED: Process was terminated by user.\n"
+        # FINAL VERIFICATION
+        if os.path.exists(final_output_path):
+            log_acc += f"✅ SUCCESS: File confirmed at {final_output_path}\n"
+            # IMPORTANT: We update last_path_state so the "Sync" button knows what to move
+            yield log_acc, final_output_path
         else:
-            log_acc += f"❌ FAILED (Code {active_process.returncode})\n"
+            log_acc += f"❌ ERROR: Quantizer finished but {final_name} was not found in target dir.\n"
+            yield log_acc, ""
 
-        active_process = None # Clear tracker
+        active_process = None
 
         if auto_move and os.path.exists(final_output_path):
-            log_acc += f"{sync_ram_to_ssd(final_output_path)}\n"
-
-        log_acc += "-"*60 + "\n✨ SESSION COMPLETE.\n"
-        yield log_acc, final_output_path
-
-    except Exception as e:
-        log_acc += f"\n❌ CRITICAL ERROR: {str(e)}\n"
-        yield log_acc, ""
+            # If it's already on the SSD (because RAMDisk didn't exist), sync_ram_to_ssd handles it
+            log_acc += f"🚀 AUTO-MOVE: {sync_ram_to_ssd(final_output_path)}\n"
+            yield log_acc, final_output_path
 
 # --- 5. UI ARCHITECTURE ---
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
