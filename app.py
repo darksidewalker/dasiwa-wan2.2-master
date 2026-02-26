@@ -81,16 +81,42 @@ JS_AUTO_SCROLL = """
 
 # --- 3. UTILITIES ---
 def get_sys_info():
+    # System Stats
     ram = psutil.virtual_memory().percent
     cpu = psutil.cpu_percent()
-    vram = f"{torch.cuda.memory_reserved()/1e9:.1f}GB" if torch.cuda.is_available() else "0.0G"
+    
+    # GPU Stats
+    gpu_load = "0%"
+    vram_info = "0.0/0.0GB"
+    
+    if torch.cuda.is_available():
+        try:
+            # Get VRAM: Used / Total
+            v_used = torch.cuda.memory_reserved() / 1e9
+            v_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+            vram_info = f"{v_used:.1f}/{v_total:.1f}GB"
+            
+            # Get GPU Utilization % (KDE Style) via nvidia-smi
+            res = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                encoding='utf-8'
+            )
+            gpu_load = f"{res.strip()}%"
+        except:
+            gpu_load = "ERR%"
+
+    # RAMDisk Stats
     rd_status = "💾 RD: [OFFLINE]"
     if os.path.exists(RAMDISK_PATH):
         try:
             usage = psutil.disk_usage(RAMDISK_PATH)
             rd_status = f"💾 RD: {usage.used/1e9:>5.1f} / {usage.total/1e9:.1f}GB"
-        except: rd_status = "💾 RD: [LOCKED]"
-    return f"🖥️ CPU: {cpu:>5}% | RAM: {ram:>3}%\n📟 VRAM: {vram:>9}\n{rd_status}"
+        except:
+            rd_status = "💾 RD: [LOCKED]"
+
+    return (f"🖥️ CPU: {cpu:>3}% | RAM: {ram:>3}%\n"
+            f"📟 GPU: {gpu_load:>4} | VRAM: {vram_info}\n"
+            f"{rd_status}")
 
 def list_files():
     try:
@@ -250,7 +276,7 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
         with gr.Column(scale=4):
             gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**Direct-to-SSD 5D-Patching & GGUF/SVD Quantization**")
         with gr.Column(scale=2, elem_classes=["vitals-card"]):
-            vitals_box = gr.Textbox(label="Environment Stats", value=get_sys_info(), lines=3, interactive=False, container=False)
+            vitals_box = gr.Textbox(label="Environment Stats", value=get_sys_info(), lines=4, interactive=False, container=False)
             gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
 
     with gr.Row():
