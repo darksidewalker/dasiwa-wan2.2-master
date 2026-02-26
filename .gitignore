@@ -8,7 +8,7 @@ logs/
 session_recipe.json
 
 # --- Custom Build / Llama.cpp ---
-llama.cpp/
+llama.cpp/.
 build/
 bin/
 *.gguf
@@ -34,4 +34,3 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
-llama.cpp/
