@@ -55,5 +55,10 @@ Because the 55GB RAMDisk consumes a large portion of system memory, follow these
 3. Vitals Monitor: Keep an eye on the Vitals bar at the top of the GUI to ensure RAM usage stays below 90%.
 
 ### 🤝 Credits
-Quantization: [llama.cpp](https://github.com/ggml-org/llama.cpp) and [silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant).
-Utilities: [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) for Blackwell/NVFP4 support.
+Quantization: 
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant)
+- [City96](https://github.com/city96/ComfyUI-GGUF/tree/main/tools)
+
+Utilities: 
+- [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) for Blackwell/NVFP4 support.

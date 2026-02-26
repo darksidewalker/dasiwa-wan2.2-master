@@ -134,17 +134,14 @@ def run_pipeline(recipe_json, base_model, q_format, auto_move, progress=gr.Progr
         # STAGE 1: PARSING & INITIALIZATION
         progress(0.05, desc="🧬 Parsing Recipe...")
         clean_json = re.sub(r'//.*', '', recipe_json)
-        try:
-            recipe_dict = json.loads(clean_json)
-        except json.JSONDecodeError as je:
-            raise ValueError(f"JSON Syntax Error: {str(je)}")
-
+        recipe_dict = json.loads(clean_json)
         recipe_dict['paths'] = recipe_dict.get('paths', {})
         recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
         
         log_acc += f"📦 LOADING BASE: {base_model}\n"
         engine = ActionMasterEngine(recipe_dict)
-        log_acc += f"🧬 ENGINE: {'High-Res' if engine.is_high_res else 'Low-Res'} Architecture Detected.\n"
+        # FIX: Using the new role_label attribute
+        log_acc += f"🧬 ENGINE: {engine.role_label} Architecture Detected.\n"
         yield log_acc, ""
 
         # STAGE 2: THE MERGE LOOP
@@ -173,42 +170,42 @@ def run_pipeline(recipe_json, base_model, q_format, auto_move, progress=gr.Progr
             gc.collect()
             yield log_acc, ""
 
-        # STAGE 3: 5D PATCHING & RAMDISK DUMP
-        progress(0.8, desc="📐 Patching 5D Tensors...")
+# STAGE 3: DATA PREPARATION (PATCHING)
+        is_gguf = q_format.startswith("GGUF_")
+        progress(0.8, desc="📐 Preparing Tensors...")
         log_acc += "-"*60 + "\n"
-        log_acc += "📐 STAGE 3: RESHAPING 5D VIDEO TENSORS TO 4D INTERMEDIATE...\n"
-        log_acc += "💾 INJECTING: ComfyUI metadata & orig_shape keys...\n"
         
-        temp_ram_path = engine.save_and_patch(use_ramdisk=True)
-        log_acc += f"✅ INTERMEDIATE SAVED: {temp_ram_path}\n"
+        if is_gguf:
+            log_acc += "📐 GGUF DETECTED: Flattening 5D -> 4D for compatibility...\n"
+            temp_ram_path = engine.save_and_patch(use_ramdisk=True)
+        else:
+            log_acc += "💎 SVD-QUANT DETECTED: Preserving Native 5D Layout...\n"
+            temp_ram_path = engine.save_pure_5d(use_ramdisk=True)
+            
+        log_acc += f"✅ INTERMEDIATE READY: {temp_ram_path}\n"
         yield log_acc, ""
 
-        # STAGE 4: QUANTIZATION CLI HANDOFF
+        # STAGE 4: QUANTIZATION CLI HANDOFF (WITH AUTO-NAMING)
         progress(0.9, desc=f"🏗️ Conversion: {q_format}...")
         log_acc += f"🏗️ STAGE 4: COMMENCING {q_format.upper()} QUANTIZATION...\n"
         
-        if q_format.startswith("GGUF_"):
+        # Pulling output_prefix from JSON
+        out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Output')
+
+        if is_gguf:
             q_type = q_format.replace("GGUF_", "")
-            final_output_path = temp_ram_path.replace(".safetensors", f"_{q_type}.gguf")
+            # Naming: Prefix + Quant + .gguf
+            final_output_path = f"{out_prefix}_{q_type}.gguf"
             cmd = ["python", "convert_to_gguf.py", temp_ram_path, "--out", final_output_path, "--quant", q_type]
         else:
-            final_output_path = temp_ram_path.replace("_PATCHED.safetensors", f"_{q_format}.safetensors")
-            # Default to FP8 if format is blank
+            # Naming: Prefix + Quant + .safetensors
+            final_output_path = f"{out_prefix}_{q_format}.safetensors"
             fmt_flag = [] if q_format == "fp8" else [f"--{q_format}"]
             cmd = ["convert_to_quant", "-i", temp_ram_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
 
+        log_acc += f"📂 TARGET PATH: {final_output_path}\n"
         log_acc += f"🖥️ CLI EXEC: {' '.join(cmd)}\n"
         yield log_acc, ""
-
-        # Subprocess Management with real-time stream
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        for line in iter(process.stdout.readline, ""):
-            log_acc += line
-            yield log_acc, ""
-
-        process.wait()
-        if process.returncode != 0:
-            raise RuntimeError(f"Quantization failed with exit code {process.returncode}")
 
         # STAGE 5: POST-PROCESS & CLEANUP
         if os.path.exists(temp_ram_path):

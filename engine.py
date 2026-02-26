@@ -1,5 +1,5 @@
 import torch
-import os, gc, re, json, subprocess
+import os, gc, re, json
 from safetensors.torch import load_file, save_file
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -7,7 +7,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 def gpu_mm(B, A):
     """Offloads matrix math to GPU using float32 for Wan 2.2 precision."""
     with torch.no_grad():
-        # Wan 2.2 requires high precision for video latents; avoid FP16 here if possible
         B_g = B.to(DEVICE, dtype=torch.float32)
         A_g = A.to(DEVICE, dtype=torch.float32)
         res = torch.mm(B_g, A_g).to("cpu")
@@ -21,15 +20,21 @@ class ActionMasterEngine:
         self.recipe = recipe_data
         self.paths = self.recipe['paths']
         
-        print(f"📦 Loading Base Model: {self.paths['base_model']}...")
+        print(f"📦 Loading Wan 2.2 MoE Component: {self.paths['base_model']}...")
         self.base_dict = load_file(self.paths['base_model'])
         self.base_keys = list(self.base_dict.keys())
-        self.is_high_res = "high" in self.paths['base_model'].lower()
+
+        # --- WAN 2.2 MoE ROLES ---
+        # HIGH = Motion Model (Temporal Dynamics)
+        # LOW  = Refiner Model (Spatial Details)
+        self.is_motion_base = "high" in self.paths['base_model'].lower()
+        self.is_spatial_refiner = "low" in self.paths['base_model'].lower()
+        self.role_label = "MOTION (High)" if self.is_motion_base else "REFINER (Low)"
+            
+        print(f"🛰️ Engine initialized for {self.role_label}.")
 
     def get_dynamic_target(self, concept):
-        """Maps LoRA keys (e.g. transformer.blocks.1.attn) to Base keys."""
         if concept in self.bridge_cache: return self.bridge_cache[concept]
-        
         parts = re.split(r'[._]', concept)
         block_num = next((p for p in parts if p.isdigit()), None)
         components = [p for p in parts if not p.isdigit() and p != 'blocks']
@@ -44,14 +49,10 @@ class ActionMasterEngine:
         return None
 
     def process_pass(self, step, global_mult):
-        """THE CORE MERGING LOGIC: Iterates through styles and applies weights."""
         conflict_log = []
         styles = step.get('styles', [])
         use_shield = step.get('block_shield', False)
-        # Wan 2.2 Low-Res variant needs a dampener to prevent over-saturation
-        noise_dampener = 1.0 if self.is_high_res else 0.85
         
-        # Load LoRAs for this pass
         style_dicts = []
         for s in styles:
             path = os.path.join(self.paths['lora_dir'], s['file'])
@@ -60,7 +61,6 @@ class ActionMasterEngine:
             else:
                 print(f"⚠️ LoRA missing: {path}")
 
-        # Extract all unique concepts across all LoRAs in this pass
         unique_concepts = set()
         for sd in style_dicts:
             for k in sd.keys():
@@ -68,39 +68,31 @@ class ActionMasterEngine:
                 c = c.replace("lora_unet.", "").replace("transformer.", "").replace("diffusion_model.", "")
                 unique_concepts.add(c)
 
-        # Merge each concept
         for concept in unique_concepts:
             if self.abort_requested: return "ABORTED"
-            
             target_key = self.get_dynamic_target(concept)
             if not target_key: continue
 
-            # Skeletal Shielding (Blocks 0-8 handle core physics/structure)
             if use_shield and self.is_skeletal(target_key):
                 continue 
 
             layer_deltas = []
             for j, sd in enumerate(style_dicts):
-                # Flexible key matching for different LoRA naming conventions
                 up_k = next((k for k in sd.keys() if concept in k.replace("_", ".") and (".up" in k or "_B" in k or ".lora_B" in k)), None)
                 down_k = next((k for k in sd.keys() if concept in k.replace("_", ".") and (".down" in k or "_A" in k or ".lora_A" in k)), None)
 
                 if up_k and down_k:
-                    w = styles[j]['weight'] * global_mult * noise_dampener
+                    # Pure JSON Weight logic
+                    w = styles[j]['weight'] * global_mult
                     delta = gpu_mm(sd[up_k], sd[down_k]) * w
                     layer_deltas.append(delta)
 
-            # WEIGHT-SIGN ALIGNMENT (The 'Secret Sauce' for Video Models)
             if len(layer_deltas) > 1:
                 stacked = torch.stack(layer_deltas)
                 signs = torch.sign(stacked)
                 dom_sign = torch.sign(signs.sum(dim=0))
-                
-                # Check for conflicts where LoRAs fight each other
                 if not torch.all(signs[0] == signs):
                     conflict_log.append(target_key)
-                
-                # Aligned average: contributor must match the dominant sign to be included
                 mask = (signs == dom_sign).float()
                 aligned = (stacked * mask).sum(dim=0) / (stacked != 0).sum(dim=0).clamp(min=1)
                 self.apply_delta(target_key, aligned)
@@ -108,13 +100,18 @@ class ActionMasterEngine:
                 self.apply_delta(target_key, layer_deltas[0])
 
         del style_dicts
-        gc.collect()
-        torch.cuda.empty_cache()
+        self._cleanup()
         return conflict_log
 
     def is_skeletal(self, key):
         match = re.search(r'blocks?\.(\d+)\.', key.replace('_', '.'))
-        return match and int(match.group(1)) <= 8
+        if not match: return False
+        block_idx = int(match.group(1))
+        # Protecting motion physics (High) vs textures (Low)
+        if self.is_motion_base:
+            return block_idx <= 10 
+        else:
+            return block_idx <= 4  
 
     def apply_delta(self, target_key, delta):
         if self.base_dict[target_key].shape != delta.shape:
@@ -122,47 +119,53 @@ class ActionMasterEngine:
         self.base_dict[target_key] = (self.base_dict[target_key].to(torch.float32) + delta).to(self.base_dict[target_key].dtype)
 
     def save_and_patch(self, use_ramdisk=True):
-        """Live 5D Reshaping & ComfyUI Metadata Injection."""
+        """FLATTENED 4D: Memory-Safe Pop Logic for 64GB Systems."""
         out_dir = "/mnt/ramdisk" if (use_ramdisk and os.path.exists("/mnt/ramdisk")) else "models"
-        path = os.path.join(out_dir, f"{self.paths['output_prefix']}_PATCHED.safetensors")
+        path = os.path.join(out_dir, "wan22_intermediate_flattened.safetensors")
         
-        patched, meta = {}, {}
-        for k, v in self.base_dict.items():
+        meta = {
+            "modelspec.architecture": "wan_2.2_video",
+            "diffusion_model.tensor_layout": "5d_flattened_to_4d",
+            "modelspec.variant": "motion_base" if self.is_motion_base else "spatial_refiner"
+        }
+
+        patched = {}
+        # We use list(keys) so we can modify the dict size while iterating
+        for k in list(self.base_dict.keys()):
+            v = self.base_dict.pop(k) # REMOVE FROM RAM IMMEDIATELY
             if len(v.shape) == 5:
                 meta[f"comfy.gguf.orig_shape.{k}"] = json.dumps(list(v.shape))
-                patched[k] = v.reshape(-1, *v.shape[-3:])
-            else: patched[k] = v
+                patched[k] = v.reshape(-1, *v.shape[-3:]).contiguous()
+            else: 
+                patched[k] = v.contiguous()
 
         save_file(patched, path, metadata=meta)
-        del self.base_dict
-        gc.collect()
-        torch.cuda.empty_cache()
+        del patched
+        self._cleanup()
         return path
-    
-    def save_to_ramdisk(self):
-        """Saves the merged FP16 model to RAMDisk with 5D flattening for GGUF/Quant."""
-        ram_path = os.path.join("/mnt/ramdisk", f"{self.paths['output_prefix']}_TMP.safetensors")
-        
-        # 5D Flattening & Metadata Injection for GGUF compatibility
-        patched_dict = {}
-        metadata = {}
-        for k, v in self.base_dict.items():
-            if len(v.shape) == 5:
-                metadata[f"comfy.gguf.orig_shape.{k}"] = json.dumps(list(v.shape))
-                patched_dict[k] = v.reshape(-1, *v.shape[-3:])
-            else:
-                patched_dict[k] = v
 
-        save_file(patched_dict, ram_path, metadata=metadata)
+    def save_pure_5d(self, use_ramdisk=True):
+        """NATIVE 5D: Memory-Safe Pop Logic for 64GB Systems."""
+        out_dir = "/mnt/ramdisk" if (use_ramdisk and os.path.exists("/mnt/ramdisk")) else "models"
+        path = os.path.join(out_dir, "wan22_intermediate_native.safetensors")
         
-        # Crucial: Free RAM before the heavy Quantization/GGUF subprocess starts
-        del self.base_dict
+        meta = {
+            "modelspec.architecture": "wan_2.2_video",
+            "diffusion_model.tensor_layout": "5d_native",
+            "modelspec.variant": "motion_base" if self.is_motion_base else "spatial_refiner"
+        }
+
+        processed = {}
+        for k in list(self.base_dict.keys()):
+            v = self.base_dict.pop(k) # REMOVE FROM RAM IMMEDIATELY
+            processed[k] = v.contiguous()
+
+        save_file(processed, path, metadata=meta)
+        del processed
+        self._cleanup()
+        return path
+
+    def _cleanup(self):
         gc.collect()
-        torch.cuda.empty_cache()
-        return ram_path
-
-    def run_cli_task(self, cmd):
-        """Generic subprocess runner for llama.cpp/GGUF or Quant tools."""
-        import subprocess
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        return process
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
