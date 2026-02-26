@@ -34,3 +34,4 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+llama.cpp/

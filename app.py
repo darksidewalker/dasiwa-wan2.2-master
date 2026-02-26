@@ -80,33 +80,38 @@ def save_active_recipe(filename, content):
     return f"✅ Saved to {filename}"
 
 # --- Merger Logic ---
-def run_merge_pipeline(editor_content, model_filename, progress=gr.Progress()):
-    if not editor_content.strip(): return "❌ Editor empty."
-    model_path = os.path.join(MODELS_DIR, model_filename)
+def run_merge_pipeline(json_editor, model_selector, progress=gr.Progress()):
+    if not json_editor.strip(): 
+        return "❌ Editor empty."
+    
+    model_path = os.path.join(MODELS_DIR, model_selector)
+    
     try:
-        clean_json = re.sub(r'//.*', '', editor_content)
+        clean_json = re.sub(r'//.*', '', json_editor)
         recipe_data = json.loads(clean_json)
         recipe_data['paths']['base_model'] = model_path
 
-        temp_path = "session_recipe.json"
-        with open(temp_path, 'w') as f: json.dump(recipe_data, f)
-
+        # Clear memory before heavy loading
         gc.collect()
         torch.cuda.empty_cache()
 
         progress(0, desc="🚀 Initializing Engine...")
-        engine = ActionMasterEngine(temp_path)
-        logs = [f"🧬 Engine: {'HIGH' if engine.is_high_res else 'LOW'}"]
+        engine = ActionMasterEngine(recipe_data) # Pass dict directly
+        
+        logs = [f"🧬 Engine: {'HIGH' if engine.is_high_res else 'LOW'} Res Mode"]
 
-        for i, step in enumerate(engine.recipe['pipeline']):
-            progress((i/len(engine.recipe['pipeline'])), desc=f"Merging Pass {i+1}...")
+        pipeline = recipe_data.get('pipeline', [])
+        for i, step in enumerate(pipeline):
+            progress((i/len(pipeline)), desc=f"Merging Pass {i+1}...")
 
-            # Run the pass and get conflicts
-            conflicts = engine.process_pass(step, engine.paths.get('global_weight_factor', 1.0))
+            # Use the engine's internal global factor or the recipe's
+            global_mult = recipe_data['paths'].get('global_weight_factor', 1.0)
+            conflicts = engine.process_pass(step, global_mult)
 
-            # Get the heatmap data for this specific pass
+            if conflicts == "ABORTED":
+                return "🛑 Merge Aborted by User."
+
             heatmap_report = engine.get_heatmap_stats(conflicts)
-
             logs.append(f"✅ Pass {i+1} complete.")
             logs.append(heatmap_report) 
             logs.append("-" * 30)
@@ -115,11 +120,19 @@ def run_merge_pipeline(editor_content, model_filename, progress=gr.Progress()):
         return "\n".join(logs) + f"\n\n✨ SAVED: {final_file}"
 
     except Exception as e:
-        return f"❌ Merge Error: {str(e)}"
+        import traceback
+        return f"❌ Merge Error: {str(e)}\n{traceback.format_exc()}"
 
+def stop_merge():
+    global engine_instance
+    if engine_instance:
+        engine_instance.abort_requested = True
+    return "Stopping merge... cleaning VRAM."
+
+    engine_instance = ActionMasterEngine(json_editor)
+    
 # --- Quantizer Logic ---
 def run_unified_quantization(model_filename, quant_choice, keep_in_ram, progress=gr.Progress()):
-    # ... rest of your code ...
     logs = []
     five_d_counter = 0
     try:
@@ -234,29 +247,55 @@ def run_fp_quantization(model_filename, format_choice, use_wan_preset, keep_in_r
         return f"❌ Script Error: {str(e)}"
 
 # --- GUI ---
-css = "#console_logs textarea { font-family: monospace; color: #00ff88; background: #111; }"
+css = """
+#console_logs textarea {
+    background-color: #0d1117 !important;
+    color: #00ff41 !important;
+    font-family: 'Fira Code', monospace !important;
+}
+.fixed-height {
+    height: 600px !important; 
+    overflow-y: auto !important;
+}
+"""
 
+# 2. MOVE theme and css out of gr.Blocks (to fix the Gradio 6.0 warning)
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
-    gr.Markdown("# 🌀 DaSiWa WAN 2.2 Master: Merger & Quantizer")
+    gr.Markdown("# 🌀 DaSiWa WAN 2.2 Master")
 
-    with gr.Row():
-        sys_info = gr.Textbox(label="Vitals", value=get_sys_info(), interactive=False)
-        gr.Timer(2).tick(get_sys_info, outputs=sys_info)
-
-    with gr.Tabs():
-        # TAB 1: MODEL MERGER
-        with gr.Tab("🧬 Model Merger"):
-            with gr.Row():
-                with gr.Column(scale=1):
+    with gr.Tab("🧬 Model Merger"):
+        with gr.Row():
+            # SIDEBAR: Left 25%
+            with gr.Column(scale=1, min_width=300):
+                with gr.Group():
                     model_selector = gr.Dropdown(choices=get_model_list(), label="Base Model")
                     recipe_selector = gr.Dropdown(choices=get_recipe_list(), label="Select Recipe")
-                    m_refresh = gr.Button("🔄 Refresh Lists")
-                    save_recipe_btn = gr.Button("💾 Save Current Recipe", variant="secondary")
+                    
+                    with gr.Row():
+                        m_refresh = gr.Button("🔄 Refresh", size="sm") # VARIABLE DEFINED HERE
+                        save_recipe_btn = gr.Button("💾 Save", variant="secondary", size="sm")
+                
+                gr.Markdown("---")
+                run_merge_btn = gr.Button("🔥 START MERGE", variant="primary", size="lg")
+                stop_btn = gr.Button("🛑 STOP", variant="stop")
 
-                with gr.Column(scale=3):
-                    json_editor = gr.Code(label="Recipe JSON Configuration", language="json", lines=18)
-                    run_merge_btn = gr.Button("🔥 START MERGE PIPELINE", variant="primary")
-                    merge_output = gr.Textbox(label="Merger Output", lines=10, elem_id="console_logs")
+            # MAIN WORKSPACE: Right 75% (Split 50/50)
+            with gr.Column(scale=3):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        json_editor = gr.Code(
+                            label="Recipe JSON", 
+                            language="json", 
+                            lines=30, 
+                            elem_classes=["fixed-height"] # Apply scroll class
+                        )
+                    with gr.Column(scale=1):
+                        merge_output = gr.Textbox(
+                            label="Console Output", 
+                            lines=30, 
+                            elem_id="console_logs",
+                            elem_classes=["fixed-height"]
+                        )
 
         # TAB 2: GGUF QUANTIZER
         with gr.Tab("📦 GGUF Quantizer"):
@@ -303,7 +342,9 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     m_refresh.click(lambda: (gr.update(choices=get_model_list()), gr.update(choices=get_recipe_list())), outputs=[model_selector, recipe_selector])
     recipe_selector.change(load_selected_recipe, inputs=[recipe_selector], outputs=[json_editor])
     save_recipe_btn.click(save_active_recipe, inputs=[recipe_selector, json_editor], outputs=[merge_output])
-    run_merge_btn.click(run_merge_pipeline, inputs=[json_editor, model_selector], outputs=[merge_output])
+    run_merge_btn.click(fn=run_merge_pipeline, inputs=[json_editor, model_selector], outputs=merge_output)
+    stop_btn.click(fn=stop_merge, outputs=merge_output)
+    m_refresh.click(lambda: (gr.update(choices=get_model_list()), gr.update(choices=get_recipe_list())), outputs=[model_selector, recipe_selector])
 
     # 2. GGUF Quantizer Events
     q_refresh.click(lambda: gr.update(choices=get_model_list()), outputs=q_model_selector)
@@ -325,7 +366,4 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
 
 # 5. Launch (Gradio 6.0 style)
 if __name__ == "__main__":
-    demo.launch(server_port=7860, theme=gr.themes.Soft(), css=css)
-
-if __name__ == "__main__":
-    demo.launch(server_port=7860, theme=gr.themes.Soft(), css=css)
+    demo.launch(theme=gr.themes.Default(), css=css)
