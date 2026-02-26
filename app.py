@@ -17,6 +17,9 @@ RECIPES_DIR = "recipes"
 RAMDISK_PATH = "/mnt/ramdisk"
 LOGS_DIR = "logs"
 
+# Global variable to track the active quantization process
+active_process = None
+
 # Ensure directories exist
 for d in [MODELS_DIR, RECIPES_DIR, LOGS_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -108,10 +111,20 @@ def sync_ram_to_ssd(path):
         return f"✅ SYNC SUCCESS: {os.path.basename(dest)} moved to SSD."
     except Exception as e: return f"❌ SYNC FAILED: {str(e)}"
 
+def terminate_pipeline():
+    global active_process
+    if active_process and active_process.poll() is None:
+        # Kill the subprocess group (the quantizer)
+        active_process.terminate()
+        active_process = None
+        return "🛑 SYSTEM MANUALLY TERMINATED. Subprocess killed."
+    return "ℹ️ No active process to stop."
+
 # --- 4. THE MASTER PIPELINE ---
 def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, progress=gr.Progress()):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "-"*60 + "\n"
+    global active_process
     
     try:
         # STAGE 1: PARSING
@@ -128,10 +141,8 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         recipe_slug = recipe_name.replace(".json", "")
         mode_suffix = "flattened" if is_gguf else "native"
         
-        # We search the folder for a match instead of just guessing
         found_cache = None
         for f in os.listdir(MODELS_DIR):
-            # Check if filename contains BOTH recipe name and the correct suffix (native/flattened)
             if recipe_slug in f and mode_suffix in f and f.endswith(".safetensors"):
                 found_cache = os.path.join(MODELS_DIR, f)
                 break
@@ -142,7 +153,6 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             log_acc += "⏭️ SKIPPING MERGE: Using existing data.\n"
             yield log_acc, temp_path
         else:
-            # Construct the default path if no existing file is found
             model_slug = os.path.splitext(base_model)[0][:10]
             cache_name = f"cache_{model_slug}_{recipe_slug}_{mode_suffix}.safetensors"
             temp_path = os.path.join(MODELS_DIR, cache_name)
@@ -178,8 +188,6 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         # STAGE 4: QUANTIZATION (HYBRID STORAGE + LOG FILTER)
         progress(0.9, desc=f"🏗️ Conversion: {q_format}...")
         out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Output')
-        
-        # Redirect final output to RAMDISK if available
         output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
         
         if is_gguf:
@@ -198,15 +206,11 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         log_acc += "🚀 Quantizer Started... (Filtering optimization spam)\n"
         yield log_acc, temp_path
 
-        # --- REFINED MONITORING LOOP ---
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        
+        # --- REFINED MONITORING LOOP (SYNCED TO active_process) ---
+        active_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         last_log_time = time.time()
         
-        for line in process.stdout:
-            # SPAM FILTER:
-            # Hide lines containing 'worse_count' or frequent 'Optimizing' updates
-            # but keep lines with important keywords or errors.
+        for line in active_process.stdout:
             is_spam = "worse_count" in line or "Optimizing" in line
             is_important = any(k in line for k in ["Error", "Success", "Saved", "Loading", "Finalizing"])
 
@@ -214,58 +218,26 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 log_acc += f"  [QUANT] {line}"
                 yield log_acc, temp_path
             else:
-                # Optional: Show a single '.' for spam lines to show activity without scrolling
-                # or just pass to keep the terminal frozen so you can scroll up.
-                if time.time() - last_log_time > 5: # Only yield spam every 5 seconds
-                    log_acc += "  [QUANT] ...still optimizing weights...\n"
+                if time.time() - last_log_time > 8: # Pulse pulse every 8 seconds
+                    log_acc += "  [QUANT] ...still optimizing weights (background)...\n"
                     last_log_time = time.time()
                     yield log_acc, temp_path
         
-        process.wait()
+        active_process.wait()
 
-        if process.returncode == 0:
+        if active_process.returncode == 0:
             log_acc += f"✅ SUCCESS: {final_output_path}\n"
+        elif active_process.returncode == -15:
+            log_acc += "🛑 STOPPED: Process was terminated by user.\n"
         else:
-            log_acc += f"❌ FAILED (Code {process.returncode})\n"
+            log_acc += f"❌ FAILED (Code {active_process.returncode})\n"
+
+        active_process = None # Clear tracker
 
         if auto_move and os.path.exists(final_output_path):
             log_acc += f"{sync_ram_to_ssd(final_output_path)}\n"
 
         log_acc += "-"*60 + "\n✨ SESSION COMPLETE.\n"
-        yield log_acc, final_output_path
-        
-        # Redirect final output to RAMDISK
-        output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
-        
-        if is_gguf:
-            q_type = q_format.replace("GGUF_", "")
-            final_name = f"{out_prefix}_{recipe_slug}_{q_type}.gguf"
-            final_output_path = os.path.join(output_dir, final_name)
-            cmd = ["python", "convert_to_gguf.py", temp_path, "--out", final_output_path, "--quant", q_type]
-        else:
-            final_name = f"{out_prefix}_{recipe_slug}_{q_format}.safetensors"
-            final_output_path = os.path.join(output_dir, final_name)
-            fmt_flag = [] if q_format == "fp8" else [f"--{q_format}"]
-            cmd = ["convert_to_quant", "-i", temp_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
-
-        log_acc += f"🖥️ CLI EXEC: {' '.join(cmd)}\n"
-        
-        # SINGLE EXECUTION BLOCK
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        for line in process.stdout:
-            log_acc += f"  [QUANT] {line}"
-            yield log_acc, temp_path
-        
-        process.wait()
-
-        if process.returncode == 0:
-            log_acc += f"✅ SUCCESS: {final_output_path}\n"
-        else:
-            log_acc += f"❌ FAILED (Code {process.returncode})\n"
-
-        if auto_move and os.path.exists(final_output_path):
-            log_acc += f"{sync_ram_to_ssd(final_output_path)}\n"
-
         yield log_acc, final_output_path
 
     except Exception as e:
@@ -302,6 +274,7 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
                 )
                 auto_move_toggle = gr.Checkbox(label="🚀 Auto-move to SSD on finish", value=False)
                 start_btn = gr.Button("🔥 START PIPELINE", variant="primary")
+                stop_btn = gr.Button("🛑 EMERGENCY STOP", variant="stop")
             
             with gr.Group(elem_classes=["sync-box"]):
                 gr.Markdown("### 📦 SSD Synchronization")
@@ -328,7 +301,8 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
         show_progress="minimal"
     )
 
-    # Scroll Trigger
+    stop_btn.click(fn=terminate_pipeline, outputs=[terminal_box])
+
     terminal_box.change(fn=None, js=JS_AUTO_SCROLL)
 
     sync_trigger.click(fn=sync_ram_to_ssd, inputs=[last_path_state], outputs=[sync_output])
