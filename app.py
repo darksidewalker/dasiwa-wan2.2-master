@@ -17,6 +17,7 @@ RECIPES_DIR = "recipes"
 RAMDISK_PATH = "/mnt/ramdisk"
 LOGS_DIR = "logs"
 
+# Ensure directories exist
 for d in [MODELS_DIR, RECIPES_DIR, LOGS_DIR]:
     os.makedirs(d, exist_ok=True)
 
@@ -33,42 +34,19 @@ CSS_STYLE = """
 #terminal textarea::-webkit-scrollbar { width: 10px; }
 #terminal textarea::-webkit-scrollbar-track { background: #0d1117; }
 #terminal textarea::-webkit-scrollbar-thumb { background: #238636; border-radius: 5px; }
-.vitals-card { 
-    border: 1px solid #444; 
-    padding: 15px; 
-    border-radius: 12px; 
-    background: #0a0a0a;
-    box-shadow: inset 0 0 10px #000;
-}
-.vitals-card textarea {
-    background-color: transparent !important;
-    color: #00ff41 !important;
-    font-family: 'Fira Code', monospace !important;
-    border: none !important;
-    font-size: 14px !important;
-    resize: none !important;
-}
-.sync-box {
-    margin-top: 15px;
-    padding: 12px;
-    border: 1px dashed #555;
-    border-radius: 8px;
-    background: #161b22;
-}
+.vitals-card { border: 1px solid #444; padding: 15px; border-radius: 12px; background: #0a0a0a; box-shadow: inset 0 0 10px #000; }
+.vitals-card textarea { background-color: transparent !important; color: #00ff41 !important; font-family: 'Fira Code', monospace !important; border: none !important; font-size: 14px !important; resize: none !important; }
+.sync-box { margin-top: 15px; padding: 12px; border: 1px dashed #555; border-radius: 8px; background: #161b22; }
 """
 
 JS_AUTO_SCROLL = """
 () => {
-    // Target the specific textarea inside the terminal box
     const el = document.querySelector('#terminal textarea');
-    if (el) {
-        el.scrollTop = el.scrollHeight;
-    }
+    if (el) { el.scrollTop = el.scrollHeight; }
 }
 """
 
 # --- 3. UTILITIES ---
-
 def get_sys_info():
     ram = psutil.virtual_memory().percent
     cpu = psutil.cpu_percent()
@@ -77,9 +55,8 @@ def get_sys_info():
     if os.path.exists(RAMDISK_PATH):
         try:
             usage = psutil.disk_usage(RAMDISK_PATH)
-            rd_status = f"💾 RD:  {usage.used/1e9:>5.1f} / {usage.total/1e9:.1f}GB"
-        except:
-            rd_status = "💾 RD: [LOCKED]"
+            rd_status = f"💾 RD: {usage.used/1e9:>5.1f} / {usage.total/1e9:.1f}GB"
+        except: rd_status = "💾 RD: [LOCKED]"
     return f"🖥️ CPU: {cpu:>5}% | RAM: {ram:>3}%\n📟 VRAM: {vram:>9}\n{rd_status}"
 
 def list_files():
@@ -87,13 +64,11 @@ def list_files():
         m = sorted([f for f in os.listdir(MODELS_DIR) if f.endswith(('.safetensors', '.bin', '.gguf'))])
         r = sorted([f for f in os.listdir(RECIPES_DIR) if f.endswith('.json')])
         return gr.update(choices=m), gr.update(choices=r)
-    except:
-        return gr.update(choices=[]), gr.update(choices=[])
+    except: return gr.update(choices=[]), gr.update(choices=[])
 
 def load_recipe_text(name):
     if not name: return ""
-    with open(os.path.join(RECIPES_DIR, name), 'r') as f:
-        return f.read()
+    with open(os.path.join(RECIPES_DIR, name), 'r') as f: return f.read()
 
 def sync_ram_to_ssd(path):
     if not path or not os.path.exists(path): return "❌ SYNC ERROR: Path invalid."
@@ -104,7 +79,6 @@ def sync_ram_to_ssd(path):
     except Exception as e: return f"❌ SYNC FAILED: {str(e)}"
 
 # --- 4. THE MASTER PIPELINE ---
-
 def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, progress=gr.Progress()):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "-"*60 + "\n"
@@ -119,20 +93,30 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         engine = ActionMasterEngine(recipe_dict)
         log_acc += f"🧬 ENGINE: {engine.role_label} Architecture Detected.\n"
 
-        # --- DYNAMIC CACHE LOGIC ---
+        # --- DEEP CACHE LOOKUP ---
         is_gguf = q_format.startswith("GGUF_")
-        model_slug = os.path.splitext(base_model)[0][:12]
         recipe_slug = recipe_name.replace(".json", "")
+        mode_suffix = "flattened" if is_gguf else "native"
         
-        # Define cache path
-        cache_name = f"cache_{model_slug}_{recipe_slug}_{'flattened' if is_gguf else 'native'}.safetensors"
-        temp_path = os.path.join(MODELS_DIR, cache_name)
-
-        if os.path.exists(temp_path):
-            log_acc += f"♻️ CACHE HIT: Found intermediate at {temp_path}\n"
-            log_acc += "⏭️ SKIPPING MERGE: Proceeding to Quantization.\n"
+        # We search the folder for a match instead of just guessing
+        found_cache = None
+        for f in os.listdir(MODELS_DIR):
+            # Check if filename contains BOTH recipe name and the correct suffix (native/flattened)
+            if recipe_slug in f and mode_suffix in f and f.endswith(".safetensors"):
+                found_cache = os.path.join(MODELS_DIR, f)
+                break
+        
+        if found_cache:
+            temp_path = found_cache
+            log_acc += f"♻️ DEEP CACHE HIT: Found intermediate at {temp_path}\n"
+            log_acc += "⏭️ SKIPPING MERGE: Using existing data.\n"
             yield log_acc, temp_path
         else:
+            # Construct the default path if no existing file is found
+            model_slug = os.path.splitext(base_model)[0][:10]
+            cache_name = f"cache_{model_slug}_{recipe_slug}_{mode_suffix}.safetensors"
+            temp_path = os.path.join(MODELS_DIR, cache_name)
+            
             # STAGE 2: MERGE LOOP
             pipeline = recipe_dict.get('pipeline', [])
             for i, step in enumerate(pipeline):
@@ -142,36 +126,40 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 engine.process_pass(step, 1.0)
                 yield log_acc, ""
 
-            # STAGE 3: DATA PREPARATION
+            # STAGE 3: DATA PREPARATION (SSD)
             progress(0.8, desc="📐 Preparing Tensors...")
             if is_gguf:
-                log_acc += f"📐 GGUF DETECTED: Flattening to {cache_name}...\n"
+                log_acc += f"📐 GGUF: Flattening to SSD -> {cache_name}\n"
                 raw_out = engine.save_and_patch(use_ramdisk=False)
-                os.rename(raw_out, temp_path)
             else:
-                log_acc += f"💎 FP8 DETECTED: Saving Native 5D to {cache_name}...\n"
+                log_acc += f"💎 FP8: Saving Native 5D to SSD -> {cache_name}\n"
                 raw_out = engine.save_pure_5d(use_ramdisk=False)
-                os.rename(raw_out, temp_path)
             
+            os.rename(raw_out, temp_path)
             log_acc += f"✅ INTERMEDIATE SAVED: {temp_path}\n"
             yield log_acc, temp_path
 
-        # STAGE 4: QUANTIZATION
+        # STAGE 4: QUANTIZATION (HYBRID STORAGE)
         progress(0.9, desc=f"🏗️ Conversion: {q_format}...")
         out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Output')
         
+        # Redirect final output to RAMDISK
+        output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
+        
         if is_gguf:
             q_type = q_format.replace("GGUF_", "")
-            final_output_path = f"{out_prefix}_{recipe_slug}_{q_type}.gguf"
+            final_name = f"{out_prefix}_{recipe_slug}_{q_type}.gguf"
+            final_output_path = os.path.join(output_dir, final_name)
             cmd = ["python", "convert_to_gguf.py", temp_path, "--out", final_output_path, "--quant", q_type]
         else:
-            final_output_path = f"{out_prefix}_{recipe_slug}_{q_format}.safetensors"
+            final_name = f"{out_prefix}_{recipe_slug}_{q_format}.safetensors"
+            final_output_path = os.path.join(output_dir, final_name)
             fmt_flag = [] if q_format == "fp8" else [f"--{q_format}"]
             cmd = ["convert_to_quant", "-i", temp_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
 
         log_acc += f"🖥️ CLI EXEC: {' '.join(cmd)}\n"
         
-        # PROCESS MONITORING
+        # SINGLE EXECUTION BLOCK
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in process.stdout:
             log_acc += f"  [QUANT] {line}"
@@ -181,14 +169,12 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
 
         if process.returncode == 0:
             log_acc += f"✅ SUCCESS: {final_output_path}\n"
-            log_acc += f"💾 CACHE PRESERVED: {temp_path}\n"
         else:
             log_acc += f"❌ FAILED (Code {process.returncode})\n"
 
         if auto_move and os.path.exists(final_output_path):
             log_acc += f"{sync_ram_to_ssd(final_output_path)}\n"
 
-        log_acc += "-"*60 + "\n✨ SESSION COMPLETE.\n"
         yield log_acc, final_output_path
 
     except Exception as e:
@@ -196,7 +182,6 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         yield log_acc, ""
 
 # --- 5. UI ARCHITECTURE ---
-
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     with gr.Row():
         with gr.Column(scale=4):
@@ -245,7 +230,6 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     refresh_btn.click(list_files, outputs=[base_dd, recipe_dd])
     recipe_dd.change(load_recipe_text, inputs=[recipe_dd], outputs=[recipe_editor])
     
-    # We add every=1 to the click or use a specific trigger for the scroll
     start_btn.click(
         fn=run_pipeline, 
         inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], 
@@ -253,8 +237,7 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
         show_progress="minimal"
     )
 
-    # This specialized trigger watches the terminal_box for changes 
-    # and forces the scroll function to run every time it updates.
+    # Scroll Trigger
     terminal_box.change(fn=None, js=JS_AUTO_SCROLL)
 
     sync_trigger.click(fn=sync_ram_to_ssd, inputs=[last_path_state], outputs=[sync_output])
