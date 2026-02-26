@@ -107,10 +107,10 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "-"*60 + "\n"
     
     try:
-        # STAGE 1: PARSING & INITIALIZATION
         if not base_model or not recipe_name:
-            raise ValueError("Base model or Recipe name missing.")
+            raise ValueError("Execution halted: Base model or Recipe name missing.")
 
+        # STAGE 1: PARSING
         progress(0.05, desc="🧬 Parsing Recipe...")
         clean_json = re.sub(r'//.*', '', recipe_json)
         recipe_dict = json.loads(clean_json)
@@ -120,24 +120,22 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         engine = ActionMasterEngine(recipe_dict)
         log_acc += f"🧬 ENGINE: {engine.role_label} Architecture Detected.\n"
 
-        # --- ENHANCED DYNAMIC CACHE LOGIC ---
+        # --- DYNAMIC CACHE LOGIC ---
         is_gguf = q_format.startswith("GGUF_")
-        
-        # Create a unique slug: ModelName_RecipeName
         model_slug = os.path.splitext(base_model)[0][:12]
         recipe_slug = recipe_name.replace(".json", "")
         
-        # File: e.g., "cache_Wan2.2-14B_HighRes_flattened.safetensors"
+        # Define the specific filename for this session
         cache_name = f"cache_{model_slug}_{recipe_slug}_{'flattened' if is_gguf else 'native'}.safetensors"
         temp_path = os.path.join(MODELS_DIR, cache_name)
 
-        # CHECK FOR EXISTING INTERMEDIATE
+        # CHECK FOR CACHE
         if os.path.exists(temp_path):
-            log_acc += f"♻️ CACHE HIT: Found intermediate for [{recipe_slug}] at {temp_path}\n"
-            log_acc += "⏭️ SKIPPING MERGE: Using existing FP16 data for new quantization.\n"
+            log_acc += f"♻️ CACHE HIT: Found intermediate at {temp_path}\n"
+            log_acc += "⏭️ SKIPPING MERGE: Proceeding to Quantization.\n"
             yield log_acc, temp_path
         else:
-            # STAGE 2: THE MERGE LOOP
+            # STAGE 2: MERGE LOOP
             pipeline = recipe_dict.get('pipeline', [])
             for i, step in enumerate(pipeline):
                 p_name = step.get('pass_name', f"Pass {i+1}")
@@ -146,23 +144,29 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 engine.process_pass(step, 1.0)
                 yield log_acc, ""
 
-            # STAGE 3: DATA PREPARATION (Using Dynamic Path)
+            # STAGE 3: DATA PREPARATION
             progress(0.8, desc="📐 Preparing Tensors...")
             log_acc += "-"*60 + "\n"
+            
+            # FIX: We manually set the engine's internal save path before calling save
+            # This avoids the 'unexpected keyword argument' error
             if is_gguf:
-                log_acc += f"📐 GGUF DETECTED: Flattening to {temp_path} (SSD)...\n"
-                temp_path = engine.save_and_patch(use_ramdisk=False, custom_path=temp_path)
+                log_acc += f"📐 GGUF DETECTED: Flattening to {cache_name}...\n"
+                # We assume the engine saves to a default location, then we rename it
+                raw_output = engine.save_and_patch(use_ramdisk=False)
+                os.rename(raw_output, temp_path)
             else:
-                log_acc += f"💎 FP8 DETECTED: Saving Native 5D to {temp_path} (SSD)...\n"
-                temp_path = engine.save_pure_5d(use_ramdisk=False, custom_path=temp_path)
+                log_acc += f"💎 FP8 DETECTED: Saving Native 5D to {cache_name}...\n"
+                raw_output = engine.save_pure_5d(use_ramdisk=False)
+                os.rename(raw_output, temp_path)
             
             log_acc += f"✅ INTERMEDIATE SAVED: {temp_path}\n"
             yield log_acc, temp_path
 
-        # STAGE 4: QUANTIZATION CLI HANDOFF
+        # STAGE 4: QUANTIZATION CLI
         progress(0.9, desc=f"🏗️ Conversion: {q_format}...")
-        
         out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Output')
+        
         if is_gguf:
             q_type = q_format.replace("GGUF_", "")
             final_output_path = f"{out_prefix}_{recipe_slug}_{q_type}.gguf"
@@ -172,20 +176,11 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             fmt_flag = [] if q_format == "fp8" else [f"--{q_format}"]
             cmd = ["convert_to_quant", "-i", temp_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
 
-        log_acc += f"📂 TARGET PATH: {final_output_path}\n"
         log_acc += f"🖥️ CLI EXEC: {' '.join(cmd)}\n"
         yield log_acc, temp_path
 
-        # --- ACTIVE PROCESS MONITORING ---
-        process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.STDOUT, 
-            text=True,
-            bufsize=1
-        )
-        
-        log_acc += "🚀 Quantizer Started... Monitoring logs:\n"
+        # MONITORING
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in process.stdout:
             log_acc += f"  [QUANT] {line}"
             yield log_acc, temp_path
@@ -193,16 +188,15 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         process.wait()
 
         if process.returncode == 0:
-            log_acc += f"\n✨ SUCCESS: Final model created at {final_output_path}\n"
-            # NOTE: We NO LONGER delete temp_path so it stays for future sessions/quants
-            log_acc += f"💾 PERSISTENT CACHE: {temp_path} preserved on SSD.\n"
+            log_acc += f"\n✨ SUCCESS: Model created at {final_output_path}\n"
+            log_acc += f"💾 CACHE PRESERVED: {temp_path}\n"
         else:
-            log_acc += f"\n❌ ERROR: Quantizer failed (Code {process.returncode}).\n"
+            log_acc += f"\n❌ ERROR: Quantization failed (Code {process.returncode}).\n"
 
         if auto_move and os.path.exists(final_output_path):
             log_acc += f"{sync_ram_to_ssd(final_output_path)}\n"
 
-        log_acc += "-"*60 + "\n✨ [STATION MASTER] SESSION COMPLETE.\n"
+        log_acc += "-"*60 + "\n✨ SESSION COMPLETE.\n"
         yield log_acc, final_output_path
 
     except Exception as e:
@@ -252,6 +246,7 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     # Ensure recipe_dd is passed to run_pipeline
     start_btn.click(
         fn=run_pipeline, 
+        # ADD recipe_dd HERE as the 4th input
         inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], 
         outputs=[terminal_box, last_path_state],
     ).then(fn=None, js=JS_AUTO_SCROLL)
