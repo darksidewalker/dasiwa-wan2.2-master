@@ -1,369 +1,321 @@
 import gradio as gr
-import psutil, torch, time, os, json, re, gc, sys, subprocess, shutil
-import gguf
-from tqdm import tqdm
-from safetensors.torch import load_file
+import psutil
+import torch
+import os
+import json
+import re
+import gc
+import subprocess
+import shutil
+import time
+import datetime
 from engine import ActionMasterEngine
 
-# --- Configuration ---
-RECIPES_DIR = "recipes"
+# --- 1. CONFIGURATION & DIRECTORIES ---
 MODELS_DIR = "models"
+RECIPES_DIR = "recipes"
 RAMDISK_PATH = "/mnt/ramdisk"
-VENV_PYTHON = sys.executable
+LOGS_DIR = "logs"
 
-VENV_BIN = os.path.join(os.path.dirname(sys.executable), "convert_to_quant")
+for d in [MODELS_DIR, RECIPES_DIR, LOGS_DIR]:
+    os.makedirs(d, exist_ok=True)
 
-for d in [RECIPES_DIR, MODELS_DIR]:
-    if not os.path.exists(d): os.makedirs(d)
+# --- 2. THE TERMINAL & VITALS STYLE (EXTENDED) ---
+CSS_STYLE = """
+#terminal textarea { 
+    background-color: #0d1117 !important; 
+    color: #00ff41 !important; 
+    font-family: 'Fira Code', 'Cascadia Code', monospace !important; 
+    font-size: 13px !important;
+    line-height: 1.5 !important;
+    border: 1px solid #30363d !important;
+}
+#terminal textarea::-webkit-scrollbar { width: 10px; }
+#terminal textarea::-webkit-scrollbar-track { background: #0d1117; }
+#terminal textarea::-webkit-scrollbar-thumb { background: #238636; border-radius: 5px; }
+#terminal textarea::-webkit-scrollbar-thumb:hover { background: #2ea043; }
 
-class ModelWan:
-    arch = "wan"
-    keys_hiprec = [".modulation", "text_embedding.2.weight", "pos_embedder", "head.modulation"]
-    MAX_DIMS = 4
-
-# --- Utility Functions ---
-def get_ramdisk_status():
-    if not os.path.exists(RAMDISK_PATH): return "RD: N/A"
-    try:
-        st = os.statvfs(RAMDISK_PATH)
-        free = (st.f_bavail * st.f_frsize) / (1024**3)
-        total = (st.f_blocks * st.f_frsize) / (1024**3)
-        return f"RD: {total-free:.1f}/{total:.1f}G"
-    except: return "RD: Error"
-
-def clear_ramdisk():
-    if os.path.exists(RAMDISK_PATH):
-        for f in os.listdir(RAMDISK_PATH):
-            try: os.remove(os.path.join(RAMDISK_PATH, f))
-            except: pass
-        return "✅ RAMDisk Cleared"
-    return "❌ No RAMDisk"
-
-def move_rd_to_ssd():
-    if not os.path.exists(RAMDISK_PATH): return "❌ RAMDisk not found."
-    moved = []
-    # Now scans for both GGUF and Safetensors (FP8/NV4)
-    valid_exts = (".gguf", ".safetensors")
-    for f in os.listdir(RAMDISK_PATH):
-        if f.endswith(valid_exts):
-            src = os.path.join(RAMDISK_PATH, f)
-            dst = os.path.join(MODELS_DIR, f)
-            try:
-                shutil.move(src, dst)
-                moved.append(f)
-            except Exception as e:
-                return f"❌ Move failed: {str(e)}"
-    return f"✅ Moved: {', '.join(moved)}" if moved else "ℹ️ No models found in RAMDisk."
-
-def get_sys_info():
-    ram = psutil.virtual_memory().percent
-    vram = f"{torch.cuda.memory_reserved() / 1e9:.1f}G" if torch.cuda.is_available() else "0G"
-    return f"RAM: {ram}% | VRAM: {vram} | {get_ramdisk_status()}"
-
-def get_model_list():
-    files = [f for f in os.listdir(MODELS_DIR) if f.endswith('.safetensors')]
-    return sorted(files) if files else ["No models found"]
-
-def get_recipe_list():
-    files = [f for f in os.listdir(RECIPES_DIR) if f.endswith('.json')]
-    return sorted(files) if files else ["No recipes found"]
-
-def load_selected_recipe(filename):
-    if filename == "No recipes found" or not filename: return ""
-    path = os.path.join(RECIPES_DIR, filename)
-    with open(path, 'r', encoding='utf-8') as f: return f.read()
-
-def save_active_recipe(filename, content):
-    if not filename or filename == "No recipes found": return "❌ Select a name."
-    path = os.path.join(RECIPES_DIR, filename)
-    with open(path, 'w', encoding='utf-8') as f: f.write(content)
-    return f"✅ Saved to {filename}"
-
-# --- Merger Logic ---
-def run_merge_pipeline(json_editor, model_selector, progress=gr.Progress()):
-    if not json_editor.strip(): 
-        return "❌ Editor empty."
-    
-    model_path = os.path.join(MODELS_DIR, model_selector)
-    
-    try:
-        clean_json = re.sub(r'//.*', '', json_editor)
-        recipe_data = json.loads(clean_json)
-        recipe_data['paths']['base_model'] = model_path
-
-        # Clear memory before heavy loading
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        progress(0, desc="🚀 Initializing Engine...")
-        engine = ActionMasterEngine(recipe_data) # Pass dict directly
-        
-        logs = [f"🧬 Engine: {'HIGH' if engine.is_high_res else 'LOW'} Res Mode"]
-
-        pipeline = recipe_data.get('pipeline', [])
-        for i, step in enumerate(pipeline):
-            progress((i/len(pipeline)), desc=f"Merging Pass {i+1}...")
-
-            # Use the engine's internal global factor or the recipe's
-            global_mult = recipe_data['paths'].get('global_weight_factor', 1.0)
-            conflicts = engine.process_pass(step, global_mult)
-
-            if conflicts == "ABORTED":
-                return "🛑 Merge Aborted by User."
-
-            heatmap_report = engine.get_heatmap_stats(conflicts)
-            logs.append(f"✅ Pass {i+1} complete.")
-            logs.append(heatmap_report) 
-            logs.append("-" * 30)
-
-        final_file = engine.save()
-        return "\n".join(logs) + f"\n\n✨ SAVED: {final_file}"
-
-    except Exception as e:
-        import traceback
-        return f"❌ Merge Error: {str(e)}\n{traceback.format_exc()}"
-
-def stop_merge():
-    global engine_instance
-    if engine_instance:
-        engine_instance.abort_requested = True
-    return "Stopping merge... cleaning VRAM."
-
-    engine_instance = ActionMasterEngine(json_editor)
-    
-# --- Quantizer Logic ---
-def run_unified_quantization(model_filename, quant_choice, keep_in_ram, progress=gr.Progress()):
-    logs = []
-    five_d_counter = 0
-    try:
-        src_path = os.path.join(MODELS_DIR, model_filename)
-        orig_size = os.path.getsize(src_path) / (1024**3)
-        base_name = os.path.splitext(model_filename)[0]
-
-        work_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
-        temp_gguf = os.path.join(work_dir, f"{base_name}_{quant_choice}.gguf")
-        final_dest = os.path.join(MODELS_DIR, f"{base_name}_{quant_choice}.gguf")
-
-        logs.append(f"📦 Loading: {model_filename}")
-        state_dict = load_file(src_path)
-        writer = gguf.GGUFWriter(path=temp_gguf, arch=ModelWan.arch)
-
-        target_quant = getattr(gguf.GGMLQuantizationType, quant_choice)
-        writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
-        writer.add_file_type(target_quant)
-
-        tensor_keys = list(state_dict.keys())
-        for i, key in enumerate(tensor_keys):
-            data = state_dict[key]
-            progress((i/len(tensor_keys)), desc=f"Quantizing {key[:15]}...")
-            data = data.to(torch.float32).numpy() if data.dtype == torch.bfloat16 else data.numpy()
-
-            target_dtype = gguf.GGMLQuantizationType.F32 if (any(hp in key for hp in ModelWan.keys_hiprec) or len(data.shape) == 1) else target_quant
-
-            if len(data.shape) == 5:
-                writer.add_array(f"comfy.gguf.orig_shape.{key}", list(data.shape))
-                data = data.reshape(-1, *data.shape[-3:])
-                five_d_counter += 1
-
-            try:
-                writer.add_tensor(key, gguf.quants.quantize(data, target_dtype), raw_dtype=target_dtype)
-            except:
-                writer.add_tensor(key, gguf.quants.quantize(data, gguf.GGMLQuantizationType.F16), raw_dtype=gguf.GGMLQuantizationType.F16)
-
-        writer.write_header_to_file()
-        writer.write_kv_data_to_file()
-        writer.write_tensors_to_file(progress=True)
-        writer.close()
-
-        if not keep_in_ram:
-            progress(0.99, desc="🚚 Moving to SSD...")
-            shutil.move(temp_gguf, final_dest)
-            loc = "SSD (models/)"
-        else:
-            loc = "RAMDisk (/mnt/ramdisk/)"
-
-        final_path = final_dest if not keep_in_ram else temp_gguf
-        final_size = os.path.getsize(final_path) / (1024**3)
-        logs.append(f"🌀 Tagged {five_d_counter} 5D video tensors.")
-        logs.append(f"📊 Size: {orig_size:.1f}GB ➡️ {final_size:.1f}GB")
-        return "\n".join(logs) + f"\n\n✨ SUCCESS! Model saved in {loc}"
-    except Exception as e: return f"❌ Quant Error: {str(e)}"
-
-def run_fp_quantization(model_filename, format_choice, use_wan_preset, keep_in_ram, progress=gr.Progress()):
-    try:
-        # MEMORY CHECK: 64GB is tight. We check RD usage first.
-        if os.path.exists(RAMDISK_PATH):
-            st = os.statvfs(RAMDISK_PATH)
-            used_gb = (st.f_blocks - st.f_bavail) * st.f_frsize / (1024**3)
-            if used_gb > 1:
-                return "❌ RAMDisk must be EMPTY to run FP Quants on a 64GB system. Please click 'Clear RAMDisk' first."
-
-        src_path = os.path.join(MODELS_DIR, model_filename)
-        base_name = os.path.splitext(model_filename)[0]
-
-        # We write to RAMDisk for speed, but READ from SSD to save RAM
-        work_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
-        temp_output = os.path.join(work_dir, f"{base_name}_{format_choice}.safetensors")
-        final_dest = os.path.join(MODELS_DIR, f"{base_name}_{format_choice}.safetensors")
-
-        # Build the CLI command
-        # Use VENV_BIN to ensure we hit the local install
-        cmd = [VENV_BIN, "-i", src_path, "-o", temp_output]
-
-        # Format mapping logic
-        if format_choice == "nvfp4":
-            cmd.append("--nvfp4")
-        elif format_choice == "mxfp8":
-            cmd.append("--mxfp8")
-        # Note: We REMOVED the else/--fp8 block because FP8 is the default!
-
-        # Add the specific WAN handling
-        if use_wan_preset:
-            cmd.append("--wan")
-
-        # Add ComfyUI metadata tagging
-        cmd.append("--comfy_quant")
-
-        progress(0, desc="🚀 Starting FP Conversion (Streaming SSD -> RAM)...")
-
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        logs = []
-        for line in process.stdout:
-            logs.append(line.strip())
-            progress(0.5, desc="Quantizing weights...")
-
-        process.wait()
-
-        if process.returncode == 0:
-            if not keep_in_ram:
-                progress(0.9, desc="🚚 Moving output to SSD...")
-                shutil.move(temp_output, final_dest)
-                return f"✅ SUCCESS: Saved to {final_dest}"
-            return f"✅ SUCCESS: Saved in RAMDisk: {temp_output}"
-        else:
-            return f"❌ Error:\n" + "\n".join(logs[-10:])
-
-    except Exception as e:
-        return f"❌ Script Error: {str(e)}"
-
-# --- GUI ---
-css = """
-#console_logs textarea {
-    background-color: #0d1117 !important;
+.vitals-card { 
+    border: 1px solid #444; 
+    padding: 15px; 
+    border-radius: 12px; 
+    background: #0a0a0a;
+    box-shadow: inset 0 0 10px #000;
+}
+.vitals-card textarea {
+    background-color: transparent !important;
     color: #00ff41 !important;
     font-family: 'Fira Code', monospace !important;
+    border: none !important;
+    font-size: 14px !important;
+    line-height: 1.7 !important;
+    resize: none !important;
 }
-.fixed-height {
-    height: 600px !important; 
-    overflow-y: auto !important;
+.sync-box {
+    margin-top: 15px;
+    padding: 12px;
+    border: 1px dashed #555;
+    border-radius: 8px;
+    background: #161b22;
 }
 """
 
-# 2. MOVE theme and css out of gr.Blocks (to fix the Gradio 6.0 warning)
+JS_AUTO_SCROLL = """
+() => {
+    const textarea = document.querySelector('#terminal textarea');
+    if (textarea) { textarea.scrollTop = textarea.scrollHeight; }
+}
+"""
+
+# --- 3. CORE UTILITIES ---
+
+def get_sys_info():
+    """Deep hardware monitoring including RAMDisk and CPU load."""
+    ram = psutil.virtual_memory().percent
+    cpu = psutil.cpu_percent()
+    vram = f"{torch.cuda.memory_reserved()/1e9:.1f}GB" if torch.cuda.is_available() else "0.0G"
+    
+    rd_status = "RD: [OFFLINE]"
+    if os.path.exists(RAMDISK_PATH):
+        try:
+            usage = psutil.disk_usage(RAMDISK_PATH)
+            rd_status = f"💾 RD:  {usage.used/1e9:>5.1f} / {usage.total/1e9:.1f}GB"
+        except:
+            rd_status = "RD: [LOCKED]"
+            
+    return f"🖥️ CPU: {cpu:>5}% | RAM: {ram:>3}%\n📟 VRAM: {vram:>9}\n{rd_status}"
+
+def list_files():
+    """Rescans filesystem for assets."""
+    try:
+        m = sorted([f for f in os.listdir(MODELS_DIR) if f.endswith(('.safetensors', '.bin'))])
+        r = sorted([f for f in os.listdir(RECIPES_DIR) if f.endswith('.json')])
+        return gr.update(choices=m), gr.update(choices=r)
+    except Exception as e:
+        return gr.update(choices=[]), gr.update(choices=[])
+
+def load_recipe_text(name):
+    if not name: return ""
+    try:
+        with open(os.path.join(RECIPES_DIR, name), 'r') as f:
+            return f.read()
+    except Exception as e:
+        return f"// Error loading recipe: {str(e)}"
+
+def sync_ram_to_ssd(ram_path):
+    if not ram_path or not os.path.exists(ram_path):
+        return "❌ SYNC ERROR: Path invalid or file missing from RAMDisk."
+    
+    filename = os.path.basename(ram_path)
+    dest = os.path.join(MODELS_DIR, filename)
+    
+    start_time = time.time()
+    try:
+        shutil.move(ram_path, dest)
+        duration = time.time() - start_time
+        return f"✅ SYNC SUCCESS: {filename} moved to SSD in {duration:.1f}s"
+    except Exception as e:
+        return f"❌ SYNC FAILED: {str(e)}"
+
+# --- 4. THE MASTER PIPELINE (UNABRIDGED) ---
+
+def run_pipeline(recipe_json, base_model, q_format, auto_move, progress=gr.Progress()):
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER INITIALIZING...\n"
+    log_acc += f"[{timestamp}] 🛠️ COMPONENT: v2.2-Wan Master\n"
+    log_acc += "-"*60 + "\n"
+    
+    final_output_path = ""
+    
+    try:
+        if not base_model:
+            raise ValueError("Execution halted: No base model selected.")
+
+        # STAGE 1: PARSING & INITIALIZATION
+        progress(0.05, desc="🧬 Parsing Recipe...")
+        clean_json = re.sub(r'//.*', '', recipe_json)
+        try:
+            recipe_dict = json.loads(clean_json)
+        except json.JSONDecodeError as je:
+            raise ValueError(f"JSON Syntax Error: {str(je)}")
+
+        recipe_dict['paths'] = recipe_dict.get('paths', {})
+        recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
+        
+        log_acc += f"📦 LOADING BASE: {base_model}\n"
+        engine = ActionMasterEngine(recipe_dict)
+        log_acc += f"🧬 ENGINE: {'High-Res' if engine.is_high_res else 'Low-Res'} Architecture Detected.\n"
+        yield log_acc, ""
+
+        # STAGE 2: THE MERGE LOOP
+        pipeline = engine.recipe.get('pipeline', [])
+        for i, step in enumerate(pipeline):
+            p_name = step.get('name', f"Pass {i+1}")
+            progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}...")
+            
+            log_acc += f"▶️ EXECUTING: {p_name}...\n"
+            conflicts = engine.process_pass(step, 1.0)
+            
+            # Conflict Heatmap Analysis
+            early, mid, late = 0, 0, 0
+            for c in conflicts:
+                m = re.search(r'blocks\.(\d+)\.', c)
+                if m:
+                    blk = int(m.group(1))
+                    if blk <= 8: early += 1
+                    elif 9 <= blk <= 30: mid += 1
+                    else: late += 1
+            
+            log_acc += f"  └ Conflicts -> E:[{early}] M:[{mid}] L:[{late}]\n"
+            log_acc += f"  └ VRAM Usage: {torch.cuda.memory_allocated()/1e9:.2f}GB\n"
+            
+            torch.cuda.empty_cache()
+            gc.collect()
+            yield log_acc, ""
+
+        # STAGE 3: 5D PATCHING & RAMDISK DUMP
+        progress(0.8, desc="📐 Patching 5D Tensors...")
+        log_acc += "-"*60 + "\n"
+        log_acc += "📐 STAGE 3: RESHAPING 5D VIDEO TENSORS TO 4D INTERMEDIATE...\n"
+        log_acc += "💾 INJECTING: ComfyUI metadata & orig_shape keys...\n"
+        
+        temp_ram_path = engine.save_and_patch(use_ramdisk=True)
+        log_acc += f"✅ INTERMEDIATE SAVED: {temp_ram_path}\n"
+        yield log_acc, ""
+
+        # STAGE 4: QUANTIZATION CLI HANDOFF
+        progress(0.9, desc=f"🏗️ Conversion: {q_format}...")
+        log_acc += f"🏗️ STAGE 4: COMMENCING {q_format.upper()} QUANTIZATION...\n"
+        
+        if q_format.startswith("GGUF_"):
+            q_type = q_format.replace("GGUF_", "")
+            final_output_path = temp_ram_path.replace(".safetensors", f"_{q_type}.gguf")
+            cmd = ["python", "convert_to_gguf.py", temp_ram_path, "--out", final_output_path, "--quant", q_type]
+        else:
+            final_output_path = temp_ram_path.replace("_PATCHED.safetensors", f"_{q_format}.safetensors")
+            # Default to FP8 if format is blank
+            fmt_flag = [] if q_format == "fp8" else [f"--{q_format}"]
+            cmd = ["convert_to_quant", "-i", temp_ram_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
+
+        log_acc += f"🖥️ CLI EXEC: {' '.join(cmd)}\n"
+        yield log_acc, ""
+
+        # Subprocess Management with real-time stream
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in iter(process.stdout.readline, ""):
+            log_acc += line
+            yield log_acc, ""
+
+        process.wait()
+        if process.returncode != 0:
+            raise RuntimeError(f"Quantization failed with exit code {process.returncode}")
+
+        # STAGE 5: POST-PROCESS & CLEANUP
+        if os.path.exists(temp_ram_path):
+            os.remove(temp_ram_path)
+            log_acc += "🧹 CLEANUP: Intermediate FP16 purged from RAMDisk.\n"
+
+        if auto_move:
+            log_acc += "🚀 AUTO-SYNC: Moving to persistent SSD...\n"
+            sync_result = sync_ram_to_ssd(final_output_path)
+            log_acc += f"{sync_result}\n"
+        
+        log_acc += "-"*60 + "\n"
+        log_acc += "✨ [STATION MASTER] ALL TASKS COMPLETED SUCCESSFULLY.\n"
+        yield log_acc, final_output_path
+
+    except Exception as e:
+        err_msg = f"\n❌ CRITICAL PIPELINE ERROR: {str(e)}\n"
+        log_acc += err_msg
+        yield log_acc, ""
+
+# --- 5. UI ARCHITECTURE (GRADIO 6.0 COMPLIANT) ---
+
+# REMOVED css=CSS_STYLE from here
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
-    gr.Markdown("# 🌀 DaSiWa WAN 2.2 Master")
+    with gr.Row():
+        with gr.Column(scale=4):
+            gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**Direct-to-RAM 5D-Patching & GGUF/SVD Quantization**")
+        with gr.Column(scale=2, elem_classes=["vitals-card"]):
+            vitals_box = gr.Textbox(
+                label="Environment Stats", 
+                value=get_sys_info(), 
+                lines=3, 
+                interactive=False, 
+                container=False
+            )
+            gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
 
-    with gr.Tab("🧬 Model Merger"):
-        with gr.Row():
-            # SIDEBAR: Left 25%
-            with gr.Column(scale=1, min_width=300):
-                with gr.Group():
-                    model_selector = gr.Dropdown(choices=get_model_list(), label="Base Model")
-                    recipe_selector = gr.Dropdown(choices=get_recipe_list(), label="Select Recipe")
-                    
-                    with gr.Row():
-                        m_refresh = gr.Button("🔄 Refresh", size="sm") # VARIABLE DEFINED HERE
-                        save_recipe_btn = gr.Button("💾 Save", variant="secondary", size="sm")
-                
-                gr.Markdown("---")
-                run_merge_btn = gr.Button("🔥 START MERGE", variant="primary", size="lg")
-                stop_btn = gr.Button("🛑 STOP", variant="stop")
+    with gr.Row():
+        with gr.Column(scale=1, min_width=320):
+            with gr.Group():
+                gr.Markdown("### 📂 Asset Management")
+                base_dd = gr.Dropdown(label="Base Model (Safetensors)")
+                recipe_dd = gr.Dropdown(label="Recipe (JSON)")
+                refresh_btn = gr.Button("🔄 Refresh Asset Directories")
+            
+            with gr.Group():
+                gr.Markdown("### 💎 Quantization Target")
+                quant_select = gr.Dropdown(
+                    choices=[
+                        "fp8", "nvfp4", "mxfp8", "int8",
+                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q5_K_M", 
+                        "GGUF_Q4_K_M", "GGUF_Q3_K_L", "GGUF_Q2_K"
+                    ], 
+                    value="fp8", 
+                    label="Target Format"
+                )
+                auto_move_toggle = gr.Checkbox(label="🚀 Auto-move to SSD on finish", value=False)
+                start_btn = gr.Button("🔥 START PIPELINE", variant="primary")
+            
+            with gr.Group(elem_classes=["sync-box"]):
+                gr.Markdown("### 📦 SSD Synchronization")
+                last_path_state = gr.State("")
+                sync_trigger = gr.Button("📤 Move RAMDisk -> SSD")
+                sync_output = gr.Markdown("Status: Idle")
 
-            # MAIN WORKSPACE: Right 75% (Split 50/50)
-            with gr.Column(scale=3):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        json_editor = gr.Code(
-                            label="Recipe JSON", 
-                            language="json", 
-                            lines=30, 
-                            elem_classes=["fixed-height"] # Apply scroll class
-                        )
-                    with gr.Column(scale=1):
-                        merge_output = gr.Textbox(
-                            label="Console Output", 
-                            lines=30, 
-                            elem_id="console_logs",
-                            elem_classes=["fixed-height"]
-                        )
-
-        # TAB 2: GGUF QUANTIZER
-        with gr.Tab("📦 GGUF Quantizer"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    q_model_selector = gr.Dropdown(choices=get_model_list(), label="Source Model")
-                    q_refresh = gr.Button("🔄 Refresh List")
-                    q_type = gr.Dropdown(
-                        choices=["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "Q2_K"],
-                        value="Q8_0",
-                        label="Target Quantization"
+        with gr.Column(scale=2):
+            with gr.Tabs() as work_tabs:
+                # 1. Terminal is FIRST and ACTIVE by default
+                with gr.Tab("💻 Live Terminal", id="terminal_tab"):
+                    terminal_box = gr.Textbox(
+                        label="CLI Live Stream", 
+                        lines=28, 
+                        interactive=False, 
+                        elem_id="terminal"
                     )
-                    keep_ram_toggle = gr.Checkbox(label="🚀 Keep in RAMDisk (Fast Upload)", value=True)
-                    run_q_btn = gr.Button("🏗️ BEGIN CONVERSION", variant="primary")
-                    gr.Markdown("---")
-                    move_to_ssd_btn = gr.Button("🚚 Move RD Models to SSD", variant="secondary")
-                    rd_clear_btn = gr.Button("🧹 Clear RAMDisk", variant="stop")
+                # 2. Editor is SECOND
+                with gr.Tab("📝 Recipe Editor", id="editor_tab"):
+                    recipe_editor = gr.Code(
+                        label="JSON Configuration", 
+                        language="json", 
+                        lines=25
+                    )
 
-                with gr.Column(scale=2):
-                    q_output = gr.Textbox(label="Quantizer Output", lines=20, elem_id="console_logs")
+    # --- 6. EVENT BINDINGS ---
+    demo.load(list_files, outputs=[base_dd, recipe_dd])
+    refresh_btn.click(list_files, outputs=[base_dd, recipe_dd])
+    
+    recipe_dd.change(
+        fn=load_recipe_text, 
+        inputs=[recipe_dd], 
+        outputs=[recipe_editor]
+    )
+    
+    # FIXED: Changed _js to js
+    start_btn.click(
+        fn=run_pipeline, 
+        inputs=[recipe_editor, base_dd, quant_select, auto_move_toggle], 
+        outputs=[terminal_box, last_path_state],
+    ).then(fn=None, js=JS_AUTO_SCROLL) 
 
-        # TAB 3: FP8 / NVFP4 QUANTIZER
-        with gr.Tab("💎 FP Quants (FP8/NV4)"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    fp_model_selector = gr.Dropdown(choices=get_model_list(), label="Source Model")
-                    fp_refresh = gr.Button("🔄 Refresh List")
-                    fp_format = gr.Radio(choices=["fp8", "nvfp4", "mxfp8"], value="fp8", label="Format")
-                    wan_preset = gr.Checkbox(label="🛠️ Use WAN Video Preset", value=True)
-                    keep_ram_toggle_fp = gr.Checkbox(label="🚀 Keep in RAMDisk (Fast Upload)", value=True)
-                    run_fp_btn = gr.Button("🏗️ CONVERT TO FP", variant="primary")
-
-                    gr.Markdown("---")
-                    # Added these for convenience on this tab
-                    move_to_ssd_fp = gr.Button("🚚 Move RD Models to SSD", variant="secondary")
-                    rd_clear_fp = gr.Button("🧹 Clear RAMDisk", variant="stop")
-
-                with gr.Column(scale=2):
-                    fp_output = gr.Textbox(label="FP Quant Logs", lines=20, elem_id="console_logs")
-
-    # --- Event Wiring ---
-
-    # 1. Merger Events
-    m_refresh.click(lambda: (gr.update(choices=get_model_list()), gr.update(choices=get_recipe_list())), outputs=[model_selector, recipe_selector])
-    recipe_selector.change(load_selected_recipe, inputs=[recipe_selector], outputs=[json_editor])
-    save_recipe_btn.click(save_active_recipe, inputs=[recipe_selector, json_editor], outputs=[merge_output])
-    run_merge_btn.click(fn=run_merge_pipeline, inputs=[json_editor, model_selector], outputs=merge_output)
-    stop_btn.click(fn=stop_merge, outputs=merge_output)
-    m_refresh.click(lambda: (gr.update(choices=get_model_list()), gr.update(choices=get_recipe_list())), outputs=[model_selector, recipe_selector])
-
-    # 2. GGUF Quantizer Events
-    q_refresh.click(lambda: gr.update(choices=get_model_list()), outputs=q_model_selector)
-    run_q_btn.click(run_unified_quantization, inputs=[q_model_selector, q_type, keep_ram_toggle], outputs=[q_output])
-
-    # 3. FP Quantizer Events (The Fix)
-    fp_refresh.click(lambda: gr.update(choices=get_model_list()), outputs=fp_model_selector)
-    run_fp_btn.click(
-        run_fp_quantization,
-        inputs=[fp_model_selector, fp_format, wan_preset, keep_ram_toggle_fp],
-        outputs=[fp_output]  # <--- Ensure this matches the variable name in Tab 3
+    sync_trigger.click(
+        fn=sync_ram_to_ssd, 
+        inputs=[last_path_state], 
+        outputs=[sync_output]
     )
 
-    # 4. Utilities
-    move_to_ssd_btn.click(move_rd_to_ssd, outputs=[q_output])
-    rd_clear_btn.click(clear_ramdisk, outputs=[q_output])
-    move_to_ssd_fp.click(move_rd_to_ssd, outputs=[fp_output])
-    rd_clear_fp.click(clear_ramdisk, outputs=[fp_output])
-
-# 5. Launch (Gradio 6.0 style)
+# --- 7. LAUNCH (CSS MOVED HERE) ---
 if __name__ == "__main__":
-    demo.launch(theme=gr.themes.Default(), css=css)
+    # CSS must be passed here in Gradio 6.0
+    demo.launch(theme=gr.themes.Soft(), css=CSS_STYLE)
