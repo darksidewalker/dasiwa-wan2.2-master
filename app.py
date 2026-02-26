@@ -30,19 +30,49 @@ CSS_STYLE = """
     font-size: 13px !important;
     line-height: 1.5 !important;
     border: 1px solid #30363d !important;
+    overflow-y: auto !important;
+    white-space: pre !important;
 }
 #terminal textarea::-webkit-scrollbar { width: 10px; }
 #terminal textarea::-webkit-scrollbar-track { background: #0d1117; }
 #terminal textarea::-webkit-scrollbar-thumb { background: #238636; border-radius: 5px; }
-.vitals-card { border: 1px solid #444; padding: 15px; border-radius: 12px; background: #0a0a0a; box-shadow: inset 0 0 10px #000; }
-.vitals-card textarea { background-color: transparent !important; color: #00ff41 !important; font-family: 'Fira Code', monospace !important; border: none !important; font-size: 14px !important; resize: none !important; }
-.sync-box { margin-top: 15px; padding: 12px; border: 1px dashed #555; border-radius: 8px; background: #161b22; }
+
+.vitals-card { 
+    border: 1px solid #444; 
+    padding: 15px; 
+    border-radius: 12px; 
+    background: #0a0a0a; 
+    box-shadow: inset 0 0 10px #000; 
+}
+.vitals-card textarea { 
+    background-color: transparent !important; 
+    color: #00ff41 !important; 
+    font-family: 'Fira Code', monospace !important; 
+    border: none !important; 
+    font-size: 14px !important; 
+    resize: none !important; 
+}
+.sync-box { 
+    margin-top: 15px; 
+    padding: 12px; 
+    border: 1px dashed #555; 
+    border-radius: 8px; 
+    background: #161b22; 
+}
 """
 
 JS_AUTO_SCROLL = """
 () => {
     const el = document.querySelector('#terminal textarea');
-    if (el) { el.scrollTop = el.scrollHeight; }
+    if (el) { 
+        // Only scroll if we aren't manually looking at history
+        // This check allows you to scroll up without it snapping back constantly
+        const threshold = 100; 
+        const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+        if (isAtBottom) {
+            el.scrollTop = el.scrollHeight; 
+        }
+    }
 }
 """
 
@@ -138,10 +168,71 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             os.rename(raw_out, temp_path)
             log_acc += f"✅ INTERMEDIATE SAVED: {temp_path}\n"
             yield log_acc, temp_path
+        
+        # Clean up VRAM/RAM before the heavy lifting    
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_acc += "🧹 MEMORY: VRAM flushed for Quantization.\n"
+        yield log_acc, temp_path
 
-        # STAGE 4: QUANTIZATION (HYBRID STORAGE)
+        # STAGE 4: QUANTIZATION (HYBRID STORAGE + LOG FILTER)
         progress(0.9, desc=f"🏗️ Conversion: {q_format}...")
         out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Output')
+        
+        # Redirect final output to RAMDISK if available
+        output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
+        
+        if is_gguf:
+            q_type = q_format.replace("GGUF_", "")
+            final_name = f"{out_prefix}_{recipe_slug}_{q_type}.gguf"
+            final_output_path = os.path.join(output_dir, final_name)
+            cmd = ["python", "convert_to_gguf.py", temp_path, "--out", final_output_path, "--quant", q_type]
+        else:
+            final_name = f"{out_prefix}_{recipe_slug}_{q_format}.safetensors"
+            final_output_path = os.path.join(output_dir, final_name)
+            fmt_flag = [] if q_format == "fp8" else [f"--{q_format}"]
+            cmd = ["convert_to_quant", "-i", temp_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
+
+        log_acc += f"🖥️ CLI EXEC: {' '.join(cmd)}\n"
+        log_acc += f"🛰️ OUTPUT TARGET: {'RAMDisk' if output_dir == RAMDISK_PATH else 'SSD'}\n"
+        log_acc += "🚀 Quantizer Started... (Filtering optimization spam)\n"
+        yield log_acc, temp_path
+
+        # --- REFINED MONITORING LOOP ---
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        
+        last_log_time = time.time()
+        
+        for line in process.stdout:
+            # SPAM FILTER:
+            # Hide lines containing 'worse_count' or frequent 'Optimizing' updates
+            # but keep lines with important keywords or errors.
+            is_spam = "worse_count" in line or "Optimizing" in line
+            is_important = any(k in line for k in ["Error", "Success", "Saved", "Loading", "Finalizing"])
+
+            if is_important or not is_spam:
+                log_acc += f"  [QUANT] {line}"
+                yield log_acc, temp_path
+            else:
+                # Optional: Show a single '.' for spam lines to show activity without scrolling
+                # or just pass to keep the terminal frozen so you can scroll up.
+                if time.time() - last_log_time > 5: # Only yield spam every 5 seconds
+                    log_acc += "  [QUANT] ...still optimizing weights...\n"
+                    last_log_time = time.time()
+                    yield log_acc, temp_path
+        
+        process.wait()
+
+        if process.returncode == 0:
+            log_acc += f"✅ SUCCESS: {final_output_path}\n"
+        else:
+            log_acc += f"❌ FAILED (Code {process.returncode})\n"
+
+        if auto_move and os.path.exists(final_output_path):
+            log_acc += f"{sync_ram_to_ssd(final_output_path)}\n"
+
+        log_acc += "-"*60 + "\n✨ SESSION COMPLETE.\n"
+        yield log_acc, final_output_path
         
         # Redirect final output to RAMDISK
         output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
