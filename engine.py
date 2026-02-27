@@ -7,6 +7,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 class ActionMasterEngine:
     def __init__(self, recipe_data):
         self.recipe = recipe_data
+        base_path = recipe.get('paths', {}).get('base_model', "").lower()
+        self.is_motion_base = "high" in base_path or "i2v" in base_path
+        self.role_label = "HIGH-NOISE (Motion)" if self.is_motion_base else "LOW-NOISE (Refiner)"
         self.paths = self.recipe.get('paths', {})
         self.summary_data = [] 
         
@@ -53,16 +56,17 @@ class ActionMasterEngine:
             print("✅ Recipe validation passed: No noise-level conflicts detected.")
     
     def get_compatibility_report(self):
+        """Returns list of LoRAs that contain the 'forbidden' noise-level keyword."""
         forbidden = "low" if self.is_motion_base else "high"
         mismatches = []
         
-        for step in self.recipe.get('pipeline', []):
+        pipeline = self.recipe.get('pipeline', [])
+        for step in pipeline:
             for feature in step.get('features', []):
                 fname = feature['file'].lower()
                 if forbidden in fname:
                     mismatches.append(feature['file'])
-        
-        return mismatches # Returns a list of bad files
+        return mismatches
 
     def scan_lora_density(self, lora_sd):
         mags = [v.abs().mean().item() for k, v in lora_sd.items() if "weight" in k or ".diff" in k]

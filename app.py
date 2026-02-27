@@ -111,7 +111,32 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         
         engine = ActionMasterEngine(recipe_dict)
 
-        # --- NEW: NOISE-LEVEL VALIDATION ---
+        # --- 1. INITIALIZE ENGINE & VALIDATION ---
+        engine = ActionMasterEngine(recipe_dict)
+        mismatches = engine.get_compatibility_report()
+        
+        # --- 2. CONSTRUCT THE HEADER ---
+        border = "=" * 60
+        header_text = f"\n{border}\n"
+        header_text += f"🛡️  RECIPE VALIDATION: {engine.role_label}\n"
+        header_text += f"{border}\n"
+        
+        if mismatches:
+            header_text += f"❌ CONFLICT DETECTED: {len(mismatches)} LoRA(s) found with mismatched noise levels!\n"
+            for m in mismatches:
+                header_text += f"   - [WARN] {m}\n"
+            header_text += f"{border}\n"
+            header_text += "⚠️  PROCEEDING WITH CAUTION...\n\n"
+        else:
+            header_text += "✅ ALL SYSTEMS CLEAR: LoRA/Base Architecture Alignment Verified.\n"
+            header_text += f"{border}\n\n"
+
+        # --- 3. BROADCAST TO ALL CHANNELS ---
+        print(header_text)      # Normal CLI
+        log_acc += header_text  # WebUI Terminal (appends to accumulator)
+        yield log_acc, ""       # Update Gradio WebUI immediately
+
+        # --- NOISE-LEVEL VALIDATION ---
         mismatches = engine.get_compatibility_report()
         if mismatches:
             log_acc += f"⚠️ COMPATIBILITY WARNING: Found {len(mismatches)} LoRAs that mismatch your {engine.role_label} base:\n"
