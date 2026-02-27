@@ -1,58 +1,66 @@
 # 🌀 DaSiWa WAN 2.2 Master: Merger & Quantizer
 
-**DaSiWa WAN 2.2 Master** is a high-performance toolkit designed for merging and quantizing WAN 2.2 Video Models. It is specifically optimized for systems with 64GB RAM and NVIDIA 40-series/50-series (Blackwell) GPUs, leveraging a high-speed 55GB RAMDisk to minimize SSD wear and maximize throughput.
+DaSiWa WAN 2.2 Master is a high-performance industrial toolkit designed for merging and quantizing Wan 2.2 (14B) Video Models. Specifically engineered for systems with 64GB RAM and NVIDIA Ada (40-series) or Blackwell (50-series) GPUs, it leverages a 55GB RAMDisk to eliminate SSD bottlenecking and maximize tensor throughput.
 
 ## ✨ Key Features
 
-🧬 Model Merger: Advanced JSON-based merging using the Master-Engine. Supports multi-pass pipelines and custom recipe loading.
+🧬 Action-Master Engine: Advanced JSON-based merging logic. Supports TIES-Additive hybrid merging and multi-pass LoRA integration.
 
-📦 GGUF Quantizer: Specialized WAN 2.2 quantization with Self-Healing 5D logic to preserve video tensor shapes.
+📦 GGUF MoE Specialist: Native Wan 2.2 GGUF quantization with Self-Healing 5D Expert Injection to preserve video tensor shapes and prevent "gray-screen" outputs.
 
-💎 FP Quants (FP8/NV4): Integration with convert_to_quant and comfy-kitchen for native Blackwell (NVFP4/MXFP8) and Ada (FP8 E4M3) formats.
+💎 Next-Gen FP Quants: Native support for NVFP4 (Blackwell) and FP8 E4M3 (Ada) via optimized convert_to_quant integration.
 
-⚡ RAMDisk Integration: Direct I/O to /mnt/ramdisk for lightning-fast conversions and reduced SSD latency.
+⚡ RAMDisk-First I/O: Maps all heavy-lift operations to /mnt/ramdisk to protect SSD health and increase conversion speed by up to 4x.
 
-🛡️ 64GB Safety Logic: Intelligent memory management that prevents system crashes by monitoring RAMDisk overhead.
+🛡️ 64GB Safety Logic: Intelligent memory flushing and subprocess monitoring to prevent OOM (Out of Memory) crashes during 14B model handling.
 
-### 🚀 Quick Start
-1. Prerequisites
+## 🚀 Quick Start
+
+### Prerequisites
 
 Ensure you have uv installed for high-speed dependency management:
-
 Bash
-`curl -LsSf https://astral.sh/uv/install.sh | sh`
+``
+curl -LsSf https://astral.sh/uv/install.sh | sh
+``` 
 
-2. Installation & Launch
+### Installation & Launch
 
-The included start.sh handles RAMDisk mounting, llama.cpp building, and dependency syncing automatically.
+The included start.sh handles RAMDisk mounting, environment syncing, and build requirements automatically.
 Bash
 ```
 chmod +x start.sh
 ./start.sh
 ```
-3. Directory Structure
 
-    models/: Place your .safetensors base models here.
+#### 🛠️ Quantization Guide
+
+|Format|Target|Hardware|Recommendation|
+|-----:|-----:|-------:|-------------:|
+| GGUF (Q2-Q8) | Universal / CPU | Best for VRAM-constrained systems (8GB - 12GB).
+| FP8 (E4M3) | RTX 40-Series | Native Ada acceleration; best quality/speed balance.
+| NVFP4 | RTX 50-Series | Blackwell native 4-bit; extreme VRAM savings for 14B models.
+| MXFP8 | RTX 50-Series | Microscaled 8-bit; near-lossless video quality.
+
+### 📂 Directory Structure
+
+    models/: Place your .safetensors base models and LoRAs here.
 
     recipes/: Store your .json merge configurations here.
 
-    /mnt/ramdisk/: Used as the workspace for active quantizations.
+    logs/: Automated session logs for debugging merge weights.
 
-### 🛠️ Quantization Guide
-| Format | Target | Hardware |
-|-------:|-------:|---------:|
-GGUF | (Q2-Q8) AMD & old NV | and VRAM poor - Best for limited deployment.|
-FP8 | (E4M3) RTX 40-series | Native Ada acceleration; best quality/speed balance.|
-NVFP4 | RTX 50-series | Blackwell native 4-bit; maximum VRAM savings.|
-MXFP8 | RTX 50-series | Microscaled 8-bit; near-lossless video quality.|
+    /mnt/ramdisk/: Active workspace for quantization (volatile).
 
-⚠️ Memory Management for 64GB Systems
+### ⚠️ Memory Management for 64GB Systems
 
-Because the 55GB RAMDisk consumes a large portion of system memory, follow these rules:
+The 55GB RAMDisk consumes a large portion of system memory. To ensure stability:
 
-1. Clear First: Use the "Clear RAMDisk" button before starting a new FP8 conversion if a large model is already present.
-2. Move to SSD: Once a conversion is finished, click "Move RD Models to SSD" to free up system RAM for inference.
-3. Vitals Monitor: Keep an eye on the Vitals bar at the top of the GUI to ensure RAM usage stays below 90%.
+    Intermediate Cache: The engine saves a high-precision BF16 Master to SSD before quantizing to RAMDisk. If a quant fails, you can restart from this cache.
+
+    Vitals Monitor: Always monitor the Station Health bar in the GUI. If RAM usage exceeds 92%, terminate the process using the 🛑 STOP button.
+
+    Sync to SSD: Once a conversion is successful, use the "Manual Move to SSD" button to free up RAMDisk space before starting the next run.
 
 ### 🤝 Credits
 Quantization: 
