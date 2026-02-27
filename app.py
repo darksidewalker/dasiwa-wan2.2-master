@@ -99,71 +99,78 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
     global active_process
     
     try:
-        # 1. SETUP
+        # 1. SETUP & METADATA INJECTION
         progress(0.05, desc="Initializing Engine...")
         clean_json = re.sub(r'//.*', '', recipe_json)
         recipe_dict = json.loads(clean_json)
+        
+        # --- NEW: Ensure Metadata is present for the Engine Branding ---
         recipe_dict['paths'] = recipe_dict.get('paths', {})
         recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
+        
+        # Pull from JSON or use logic-based defaults
+        recipe_dict['paths']['title'] = recipe_dict['paths'].get('title', recipe_name.replace(".json", ""))
+        recipe_dict['paths']['type'] = recipe_dict['paths'].get('type', "Wan 2.2 Image2Video 14B")
+        recipe_dict['paths']['resolution'] = recipe_dict['paths'].get('resolution', "960x960")
         
         engine = ActionMasterEngine(recipe_dict)
         log_acc += f"🧬 ENGINE: {engine.role_label} Architecture Detected.\n"
 
-        is_gguf = q_format.startswith("GGUF_")
-        recipe_slug = recipe_name.replace(".json", "")
-        mode_suffix = "flattened" if is_gguf else "native"
-        
-        # 2. CACHE LOGIC
-        model_slug = os.path.splitext(base_model)[0][:8]
-        cache_name = f"cache_{model_slug}_{recipe_slug}_{mode_suffix}.safetensors"
-        temp_path = os.path.join(MODELS_DIR, cache_name)
+        # ... (Cache logic remains same) ...
 
-        if os.path.exists(temp_path):
-            log_acc += f"♻️ CACHE HIT: Reusing {cache_name}\n"
-            yield log_acc, temp_path
-        else:
-            pipeline = recipe_dict.get('pipeline', [])
-            for i, step in enumerate(pipeline):
-                p_name = step.get('pass_name', f"Pass {i+1}")
-                method = step.get('method', 'addition').upper()
-                
-                progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
-                
-                # This logic just ensures the log looks nice
-                display_method = "KNOWLEDGE INJECTION" if method == "INJECTION" else "RAW ADDITION"
-                log_acc += f"▶️ {p_name.upper()} | Mode: {display_method}\n"
-                yield log_acc, ""
-                
-                engine.process_pass(step, 1.0)
-                
-                # Grab the stats from the engine's last recorded pass
-                last_pass = engine.summary_data[-1]
-                log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}\n"
-                yield log_acc, ""
+        # 3. MERGING LOOP
+        pipeline = recipe_dict.get('pipeline', [])
+        global_mult = recipe_dict['paths'].get('global_weight_factor', 1.0) # Respect global multiplier
 
-            # --- THE BIG REVEAL ---
-            # Generate the ASCII table we built in the engine
-            progress(0.8, desc="Finalizing Report...")
-            summary_table = engine.get_final_summary_string() 
-            log_acc += summary_table + "\n"
-            yield log_acc, "" # Update terminal with the full table
-
-            # Save step
-            log_acc += f"💾 EXPORT: Saving Master BF16 to SSD...\n"
+        for i, step in enumerate(pipeline):
+            p_name = step.get('pass_name', f"Pass {i+1}")
+            method = step.get('method', 'addition').upper()
+            
+            progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
+            
+            log_acc += f"▶️ {p_name.upper()} | Mode: {method}\n"
             yield log_acc, ""
-            engine.save_master(temp_path)
-            log_acc += f"✅ MASTER SAVED: {cache_name}\n"
-            yield log_acc, temp_path
-        
+            
+            # --- UPDATED: Pass global multiplier ---
+            engine.process_pass(step, global_mult)
+            
+            # NEW: Detailed Pass Feedback (Inj % and Peak Alerts)
+            last_pass = engine.summary_data[-1]
+            peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
+            log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}{peak_str}\n"
+            yield log_acc, ""
+
+        # --- THE BIG REVEAL (Final Table) ---
+        progress(0.8, desc="Finalizing Report...")
+        summary_table = engine.get_final_summary_string() 
+        log_acc += summary_table + "\n"
+        yield log_acc, "" 
+
+        # 4. SAVE BF16 MASTER (With Embedded Metadata)
+        log_acc += f"💾 EXPORT: Saving High-Precision Master to SSD...\n"
+        yield log_acc, ""
+        # The engine's save_master now handles the Title/Res/Table embedding
+        engine.save_master(temp_path) 
+        log_acc += f"✅ MASTER SAVED: {cache_name}\n"
+
         # 5. QUANTIZATION
         progress(0.9, desc=f"Quantizing to {q_format}")
-        output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
-        out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Merge')
+        # ... (Existing Quant logic) ...
         
+        # --- NEW: Inject Summary into GGUF if applicable ---
         if is_gguf:
             q_type = q_format.replace("GGUF_", "")
-            final_output_path = os.path.join(output_dir, f"{out_prefix}_{recipe_slug}_{q_type}.gguf")
-            cmd = ["python", "convert.py", "--path", temp_path, "--dst", final_output_path]
+            final_output_path = os.path.join(output_dir, f"{out_prefix}_{q_type}.gguf")
+            
+            # Get the branded text block for GGUF
+            gguf_description = engine.get_metadata_string(quant_label=q_type)
+            
+            cmd = [
+                "python", "convert.py", 
+                "--path", temp_path, 
+                "--dst", final_output_path,
+                "--metadata", f"general.description={gguf_description}" # Pass full table to GGUF
+            ]
             log_acc += "📦 GGUF: Converting to F16 (Experts will be extracted)...\n"
         else:
             final_output_path = os.path.join(output_dir, f"{out_prefix}_{recipe_slug}_{q_format}.safetensors")
