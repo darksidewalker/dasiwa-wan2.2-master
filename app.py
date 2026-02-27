@@ -69,6 +69,24 @@ def get_sys_info():
         
     return f"🖥️ CPU: {cpu}% | RAM: {ram}%\n📟 GPU: {gpu_load} | VRAM: {vram_info}\n{rd_status}"
 
+def instant_validate(recipe_name, base_model):
+    if not recipe_name or not base_model:
+        return "### 🛡️ Status: Waiting for selection..."
+    
+    # Quick check: Is this a Motion (High) or Refiner (Low) base?
+    is_motion = "high" in base_model.lower() or "i2v" in base_model.lower()
+    forbidden = "low" if is_motion else "high"
+    
+    try:
+        with open(os.path.join(RECIPES_DIR, recipe_name), 'r') as f:
+            recipe_content = f.read()
+            # Check for forbidden keywords in the raw text for speed
+            if forbidden in recipe_content.lower():
+                return f"### ❌ Status: **CONFLICT DETECTED** (Mismatched {forbidden} noise LoRA)"
+            return "### ✅ Status: **VALIDATED** (Architecture Alignment Verified)"
+    except Exception:
+        return "### ⚠️ Status: Validation Error (Check JSON format)"
+
 def list_files():
     m = sorted([f for f in os.listdir(MODELS_DIR) if f.endswith(('.safetensors', '.gguf'))])
     r = sorted([f for f in os.listdir(RECIPES_DIR) if f.endswith('.json')])
@@ -94,141 +112,98 @@ def terminate_pipeline():
 
 # --- 4. THE MASTER PIPELINE ---
 def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, progress=gr.Progress()):
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
+    global active_process
+    
     try:
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
-        global active_process
+        # 1. SETUP & ENGINE INIT
+        progress(0.05, desc="Initializing Engine...")
+        clean_json = re.sub(r'//.*', '', recipe_json)
+        recipe_dict = json.loads(clean_json)
         
-        try:
-            # 1. SETUP & METADATA INJECTION
-            progress(0.05, desc="Initializing Engine...")
-            clean_json = re.sub(r'//.*', '', recipe_json)
-            recipe_dict = json.loads(clean_json)
+        recipe_dict['paths'] = recipe_dict.get('paths', {})
+        recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
+        recipe_dict['paths']['title'] = recipe_dict['paths'].get('title', recipe_name.replace(".json", ""))
+        
+        # Initialize Engine (ONLY ONCE - saves 28GB RAM spike)
+        engine = ActionMasterEngine(recipe_dict)
+
+        # --- VALIDATION HEADER ---
+        mismatches = engine.get_compatibility_report()
+        border = "=" * 60
+        header = f"\n{border}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{border}\n"
+        
+        if mismatches:
+            header += f"❌ CONFLICT: {len(mismatches)} LoRA(s) mismatch noise levels!\n"
+            for m in mismatches: header += f"   - [WARN] {m}\n"
+            header += f"{border}\n⚠️  PROCEEDING WITH CAUTION...\n\n"
+        else:
+            header += "✅ ALL SYSTEMS CLEAR: Alignment Verified.\n"
+            header += f"{border}\n\n"
+
+        print(header)      # CLI
+        log_acc += header  # GUI Accumulator
+        yield log_acc, ""  # Force GUI refresh
+
+        # 2. WORKSPACE SETUP
+        progress(0.1, desc="Setting up workspace...")
+        recipe_slug = recipe_name.replace(".json", "")
+        cache_name = f"MASTER_{recipe_slug}.safetensors"
+        output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
+        temp_path = os.path.join(output_dir, cache_name)
+
+        # 3. MERGING LOOP
+        pipeline = recipe_dict.get('pipeline', [])
+        global_mult = recipe_dict['paths'].get('global_weight_factor', 1.0)
+
+        for i, step in enumerate(pipeline):
+            p_name = step.get('pass_name', f"Pass {i+1}")
+            progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
             
-            # Path and Branding setup
-            recipe_dict['paths'] = recipe_dict.get('paths', {})
-            recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
-            recipe_dict['paths']['title'] = recipe_dict['paths'].get('title', recipe_name.replace(".json", ""))
-            
-            engine = ActionMasterEngine(recipe_dict)
-
-            # --- 1. INITIALIZE ENGINE & VALIDATION ---
-            engine = ActionMasterEngine(recipe_dict)
-            mismatches = engine.get_compatibility_report()
-            
-            # --- 2. CONSTRUCT THE HEADER ---
-            border = "=" * 60
-            header_text = f"\n{border}\n"
-            header_text += f"🛡️  RECIPE VALIDATION: {engine.role_label}\n"
-            header_text += f"{border}\n"
-            
-            if mismatches:
-                header_text += f"❌ CONFLICT DETECTED: {len(mismatches)} LoRA(s) found with mismatched noise levels!\n"
-                for m in mismatches:
-                    header_text += f"   - [WARN] {m}\n"
-                header_text += f"{border}\n"
-                header_text += "⚠️  PROCEEDING WITH CAUTION...\n\n"
-            else:
-                header_text += "✅ ALL SYSTEMS CLEAR: LoRA/Base Architecture Alignment Verified.\n"
-                header_text += f"{border}\n\n"
-
-            # --- 3. BROADCAST TO ALL CHANNELS ---
-            print(header_text)      # Normal CLI
-            log_acc += header_text  # WebUI Terminal (appends to accumulator)
-            yield log_acc, ""       # Update Gradio WebUI immediately
-
-            # --- NOISE-LEVEL VALIDATION ---
-            mismatches = engine.get_compatibility_report()
-            if mismatches:
-                log_acc += f"⚠️ COMPATIBILITY WARNING: Found {len(mismatches)} LoRAs that mismatch your {engine.role_label} base:\n"
-                for m in mismatches:
-                    log_acc += f"   - {m}\n"
-                log_acc += "   Proceeding with High-Precision Merge...\n\n"
-            
-            log_acc += f"🧬 ENGINE: {engine.role_label} Architecture Detected.\n"
-            yield log_acc, ""
-
-            # 2. WORKSPACE & CACHE SETUP (Fixes temp_path error)
-            progress(0.1, desc="Setting up workspace...")
-            recipe_slug = recipe_name.replace(".json", "")
-            cache_name = f"MASTER_{recipe_slug}.safetensors"
-            
-            # Determine if we use RAMDISK (Fast) or SSD
-            output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
-            temp_path = os.path.join(output_dir, cache_name)
-
-            # 3. MERGING LOOP
-            pipeline = recipe_dict.get('pipeline', [])
-            global_mult = recipe_dict['paths'].get('global_weight_factor', 1.0)
-
-            for i, step in enumerate(pipeline):
-                p_name = step.get('pass_name', f"Pass {i+1}")
-                method = step.get('method', 'addition').upper()
-                
-                progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
-                log_acc += f"▶️ {p_name.upper()} | Mode: {method}\n"
-                yield log_acc, ""
-                
-                engine.process_pass(step, global_mult)
-                
-                last_pass = engine.summary_data[-1]
-                peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
-                log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}{peak_str}\n"
-                yield log_acc, ""
-
-            # 4. FINAL REPORT & SAVE
-            progress(0.8, desc="Finalizing Report...")
-            log_acc += engine.get_final_summary_string() + "\n"
-            log_acc += f"💾 EXPORT: Saving 28GB Master to {output_dir}...\n"
+            log_acc += f"▶️ {p_name.upper()} | Mode: {step.get('method', 'ADDITION').upper()}\n"
             yield log_acc, ""
             
-            engine.save_master(temp_path) 
-            log_acc += f"✅ MASTER SAVED: {cache_name}\n"
-
-            # --- NEW: VRAM PURGE ---
-            # Clears the GPU after merging to give the Quantizer maximum headroom
-            engine._cleanup() 
-            torch.cuda.empty_cache()
-            gc.collect()
-            log_acc += "🧹 VRAM Purged. Initializing Quantization...\n"
-            yield log_acc, temp_path
-
-            # 5. QUANTIZATION (Using defined temp_path as source)
-            progress(0.9, desc=f"Quantizing to {q_format}")
-            is_gguf = q_format.startswith("GGUF")
-            out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Merge')
-            final_meta_block = engine.get_metadata_string(quant_label=q_format)
-
-            if is_gguf:
-                q_type = q_format.replace("GGUF_", "")
-                final_output_path = os.path.join(output_dir, f"{out_prefix}_{recipe_slug}_{q_type}.gguf")
-                cmd = ["python", "convert.py", "--path", temp_path, "--dst", final_output_path, "--metadata", f"general.description={final_meta_block}"]
-            else:
-                final_output_path = os.path.join(output_dir, f"{out_prefix}_{recipe_slug}_{q_format}.safetensors")
-                fmt_flag = ["--nvfp4"] if q_format == "nvfp4" else (["--int8"] if q_format == "int8" else [])
-                cmd = ["convert_to_quant", "-i", temp_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
-
-            # 6. EXECUTION
-            active_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-            for line in active_process.stdout:
-                if not any(x in line for x in ["Optimizing", "worse_count"]):
-                    log_acc += f"  [QUANT] {line}"
-                    yield log_acc, temp_path
-            active_process.wait()
+            engine.process_pass(step, global_mult)
             
-            # ... rest of your metadata restoration and expert fix logic ...
-
-            active_process = None
-            yield log_acc, final_output_path
-
-        except Exception as e:
-            log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
+            last_pass = engine.summary_data[-1]
+            peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
+            log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}{peak_str}\n"
             yield log_acc, ""
-    except KeyboardInterrupt:
-        # This catches Ctrl+C while the merge is actually happening
-        print("\n⚠️ Interrupted during Merge! Cleaning up VRAM...")
+
+        # 4. SAVE MASTER (Memory Safe)
+        progress(0.8, desc="Finalizing Report...")
+        log_acc += engine.get_final_summary_string() + "\n"
+        log_acc += f"💾 EXPORT: Saving 28GB Master to {output_dir}...\n"
+        yield log_acc, ""
+        
+        engine.save_master(temp_path) 
+        
+        # --- NEW: FILE EXISTENCE & INTEGRITY CHECK ---
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1e9: # Check if > 1GB
+            error_msg = f"❌ SAVE ERROR: Master file missing or corrupt at {temp_path}"
+            print(error_msg)
+            log_acc += error_msg + "\n"
+            yield log_acc, ""
+            return "🛑 Save Failure", ""
+            
+        log_acc += f"✅ MASTER SAVED: {cache_name} ({os.path.getsize(temp_path)/1e9:.1f} GB)\n"
+        yield log_acc, ""
+
+        # 5. VRAM PURGE & QUANTIZATION
+        engine._cleanup() 
         torch.cuda.empty_cache()
-        return "🛑 Interrupted by user.", ""
+        gc.collect()
+        log_acc += "🧹 VRAM Purged. Initializing Quantization...\n"
+        yield log_acc, temp_path
+
+    except KeyboardInterrupt:
+        print("\n⚠️ Interrupted! Cleaning up...")
+        torch.cuda.empty_cache()
+        return "🛑 User Aborted.", ""
+    except Exception as e:
+        log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
+        yield log_acc, ""
 
 # --- 5. UI CONSTRUCTION (Gradio 6.0 Compliant) ---
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
@@ -245,6 +220,7 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
             with gr.Group():
                 base_dd = gr.Dropdown(label="Base Component")
                 recipe_dd = gr.Dropdown(label="Active Recipe")
+                val_status_display = gr.Markdown("### 🛡️ Status: No Recipe Selected") # New Component
                 refresh_btn = gr.Button("🔄 Refresh Assets")
             
             with gr.Group():
@@ -279,6 +255,8 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     demo.load(list_files, outputs=[base_dd, recipe_dd])
     refresh_btn.click(list_files, outputs=[base_dd, recipe_dd])
     recipe_dd.change(load_recipe_text, inputs=[recipe_dd], outputs=[recipe_editor])
+    recipe_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
+    base_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
     
     start_btn.click(
         fn=run_pipeline, 

@@ -7,9 +7,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 class ActionMasterEngine:
     def __init__(self, recipe_data):
         self.recipe = recipe_data
-        base_path = recipe.get('paths', {}).get('base_model', "").lower()
-        self.is_motion_base = "high" in base_path or "i2v" in base_path
-        self.role_label = "HIGH-NOISE (Motion)" if self.is_motion_base else "LOW-NOISE (Refiner)"
         self.paths = self.recipe.get('paths', {})
         self.summary_data = [] 
         
@@ -17,9 +14,15 @@ class ActionMasterEngine:
         if not base_path or not os.path.exists(base_path):
             raise FileNotFoundError(f"❌ Base model not found at {base_path}")
             
+        # Detect Noise Level correctly
+        base_lower = base_path.lower()
+        self.is_motion_base = "high" in base_lower or "i2v" in base_lower
+        self.role_label = "MOTION (14B High Noise)" if self.is_motion_base else "REFINER (14B Low Noise)"
+        
         print(f"📥 Loading Base Model: {os.path.basename(base_path)}")
         self.base_dict = load_file(base_path)
         self.base_keys = list(self.base_dict.keys())
+        print(f"🛰️ Engine: {self.role_label} Active.")
         
         self.is_motion_base = "high" in base_path.lower()
         self.role_label = "MOTION (14B High Noise)" if self.is_motion_base else "REFINER (14B Low Noise)"
@@ -315,25 +318,28 @@ class ActionMasterEngine:
         return f"{header}\n{self.get_final_summary_string()}{branding}"
 
     def save_master(self, path):
-        # Ensure the output directory exists
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         
-        print(f"💾 EXPORT: Finalizing {os.path.basename(path)}...")
+        # 1. Prepare Metadata
         full_log = self.get_metadata_string()
         custom_metadata = {"comment": full_log, "dasiwa_summary": full_log}
         
-        # We process weights one by one to CPU to avoid RAM spikes on 14B models
-        master_sd = {}
-        for k in self.base_keys:
-            master_sd[k] = self.base_dict[k].contiguous().cpu()
-        
         try:
-            save_file(master_sd, path, metadata=custom_metadata)
+            print(f"💾 EXPORT: Writing {os.path.basename(path)}... [Do not interrupt]")
+            # Directly save self.base_dict. It is already on CPU due to your 
+            # high-precision handshake logic in apply_delta.
+            # We use contiguous() only if necessary to save memory.
+            save_file(self.base_dict, path, metadata=custom_metadata)
             print(f"✅ SUCCESS: High-Precision Master saved to {path}")
+        except KeyboardInterrupt:
+            print("\n❌ SAVE INTERRUPTED: The file at " + path + " is likely CORRUPTED.")
+            raise
         except Exception as e:
             print(f"❌ EXPORT FAILED: {str(e)}")
+        finally:
+            # Clear everything to prevent freezing the rest of the pipeline
+            self._cleanup()
             
-        self._cleanup()
         return path
 
     def _cleanup(self):
