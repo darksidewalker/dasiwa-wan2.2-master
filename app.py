@@ -234,7 +234,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         yield log_acc, "", "Critical Error"
 
 # --- 5. UI CONSTRUCTION (Gradio 6.0 Compliant) ---
-with gr.Blocks(title="DaSiWa WAN 2.2 Master", css=CSS_STYLE) as demo:
+with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     with gr.Row():
         with gr.Column(scale=3):
             gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**14B High-Precision MoE Pipeline**")
