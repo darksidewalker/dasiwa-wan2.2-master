@@ -81,7 +81,7 @@ Implementation of Knowledge-Aware Signal Processor. Instead of treating every we
 
     Behavior: Adaptive Gate opens wide (Sensitivity 0.4).
 
-    Implementation Logic: When you merge a concept like "Cum" or a specific character that doesn't exist in Wan 2.2, the LoRA’s variance is much higher than the base model’s "flat" space. The engine recognizes this as New Information and lowers the threshold to ensure these new textures are carved deeply into the model's latent space.
+    Implementation Logic: When you merge a concept like "NSFW" or a specific character that doesn't exist in Wan 2.2, the LoRA’s variance is much higher than the base model’s "flat" space. The engine recognizes this as New Information and lowers the threshold to ensure these new textures are carved deeply into the model's latent space.
 
 3. The "Noise-Gated" Refinement (injection + low variance)
 

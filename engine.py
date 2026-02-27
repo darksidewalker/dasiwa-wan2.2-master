@@ -28,19 +28,19 @@ class ActionMasterEngine:
         return avg_mag
 
     def find_lora_keys(self, lora_sd, target_key):
-        # Standardize the target path (e.g., 'blocks.0.cross_attn.k')
-        # This acts as our "anchor" that must exist in the LoRA key
+        # Anchor point
         clean_target = target_key.replace("diffusion_model.", "").replace(".weight", "")
-        
-        # Map of Up/Down pairs for your 3 specific examples
+        # Check if we are targeting a 2D weight matrix (most common) or a 1D bias
+        is_2d_target = len(self.base_dict[target_key].shape) == 2
+
+        # Suffix pairs from your 3 examples
         pairs = [
             (".lora_B", ".lora_A"),       # Example 1 & 2
             (".lora_up", ".lora_down"),   # Example 3
         ]
 
+        # Priority 1: Find Matrix Pairs (A/B or Up/Down)
         for k in lora_sd.keys():
-            # Check if the anchor path is present and strictly bounded by dots
-            # This prevents 'blocks.1' from matching 'blocks.11'
             if f"{clean_target}." in k or k.startswith(f"{clean_target}."):
                 for up_suf, down_suf in pairs:
                     if up_suf in k:
@@ -48,10 +48,13 @@ class ActionMasterEngine:
                         down_k = k.replace(up_suf, down_suf)
                         if down_k in lora_sd:
                             return up_k, down_k, "matrix"
-                
-                # Fallback for vectors/alphas
-                if any(x in k for x in [".diff", ".alpha"]):
-                    return k, None, "vector"
+        
+        # Priority 2: Fallback to Vectors ONLY if the target is also a vector/bias
+        if not is_2d_target:
+            for k in lora_sd.keys():
+                if f"{clean_target}." in k or k.startswith(f"{clean_target}."):
+                    if any(x in k for x in [".diff", ".alpha", ".bias"]):
+                        return k, None, "vector"
                     
         return None, None, None
 
@@ -162,10 +165,28 @@ class ActionMasterEngine:
 
     def apply_delta(self, target_key, delta):
         base = self.base_dict[target_key]
-        if delta.numel() == base.numel(): delta = delta.reshape(base.shape)
-        elif delta.t().shape == base.shape: delta = delta.t()
-        else: return False
-        self.base_dict[target_key] = (base.to(torch.float32) + delta.to(base.device)).to(base.dtype)
+        
+        # Guard: Ensure we aren't trying to add a 1D vector to a 2D matrix
+        if delta.ndim != base.ndim:
+            return False 
+
+        # Handle Transposition (Some LoRAs are saved as [Rank, Dim] vs [Dim, Rank])
+        if delta.numel() == base.numel():
+            delta = delta.reshape(base.shape)
+        elif delta.t().shape == base.shape:
+            delta = delta.t()
+        else:
+            return False
+
+        # Execute Merge: Delta (from GPU) + Base (on CPU)
+        with torch.no_grad():
+            # Move delta to CPU for the math to avoid Device Mismatch
+            # Use float32 for the calculation to maintain "Master" quality
+            merged = base.to(torch.float32) + delta.to("cpu", dtype=torch.float32)
+            
+            # Cast back to the base model's native precision (BF16/FP16)
+            self.base_dict[target_key] = merged.to(base.dtype)
+            
         return True
 
     def get_final_summary_string(self):
@@ -206,10 +227,24 @@ class ActionMasterEngine:
         return f"{header}\n{self.get_final_summary_string()}{branding}"
 
     def save_master(self, path):
+        # Ensure the output directory exists
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        
+        print(f"💾 EXPORT: Finalizing {os.path.basename(path)}...")
         full_log = self.get_metadata_string()
         custom_metadata = {"comment": full_log, "dasiwa_summary": full_log}
-        master_sd = {k: v.contiguous().cpu() for k, v in self.base_dict.items()}
-        save_file(master_sd, path, metadata=custom_metadata)
+        
+        # We process weights one by one to CPU to avoid RAM spikes on 14B models
+        master_sd = {}
+        for k in self.base_keys:
+            master_sd[k] = self.base_dict[k].contiguous().cpu()
+        
+        try:
+            save_file(master_sd, path, metadata=custom_metadata)
+            print(f"✅ SUCCESS: High-Precision Master saved to {path}")
+        except Exception as e:
+            print(f"❌ EXPORT FAILED: {str(e)}")
+            
         self._cleanup()
         return path
 
