@@ -140,80 +140,88 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
     # Path for final GGUF (Always RAM Disk if available)
     final_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
     
+    # --- SMART SKIP LOGIC ---
+    # Check if a valid master already exists on SSD
+    master_exists = os.path.exists(temp_path) and os.path.getsize(temp_path) > 1e9
+    # Skip merging if file exists AND we aren't explicitly asking for a new FP16 Master
+    skip_merge = master_exists and q_format != "None (FP16 Master)"
+    
     try:
-        # 1. SETUP & ENGINE INIT
-        progress(0.05, desc="Initializing Engine...")
-        yield log_acc, "", "Initializing Engine..."
-        
-        clean_json = re.sub(r'//.*', '', recipe_json)
-        recipe_dict = json.loads(clean_json)
-        
-        recipe_dict['paths'] = recipe_dict.get('paths', {})
-        recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
-        recipe_dict['paths']['title'] = recipe_dict['paths'].get('title', recipe_slug)
-        
-        # Initialize Engine
-        engine = ActionMasterEngine(recipe_dict)
-
-        # --- VALIDATION HEADER ---
-        mismatches = engine.get_compatibility_report()
-        border = "=" * 60
-        header = f"\n{border}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{border}\n"
-        
-        if mismatches:
-            header += f"❌ CONFLICT: {len(mismatches)} LoRA(s) mismatch noise levels!\n"
-            for m in mismatches: header += f"   - [WARN] {m}\n"
-            header += f"{border}\n⚠️  PROCEEDING WITH CAUTION...\n\n"
+        if skip_merge:
+            log_acc += f"⚡ FAST TRACK: Found existing Master: {cache_name}\n"
+            log_acc += "⏭️ Skipping Merge Loop and jumping to Quantization...\n\n"
+            yield log_acc, "", "Fast Tracking..."
         else:
-            header += "✅ ALL SYSTEMS CLEAR: Alignment Verified.\n"
-            header += f"{border}\n\n"
-
-        log_acc += header
-        yield log_acc, "", "Merging Layers..."
-
-        # 2. MERGING LOOP
-        pipeline = recipe_dict.get('pipeline', [])
-        global_mult = recipe_dict['paths'].get('global_weight_factor', 1.0)
-
-        for i, step in enumerate(pipeline):
-            p_name = step.get('pass_name', f"Pass {i+1}")
-            progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
+            # 1. SETUP & ENGINE INIT
+            progress(0.05, desc="Initializing Engine...")
+            yield log_acc, "", "Initializing Engine..."
             
-            log_acc += f"▶️ {p_name.upper()} | Mode: {step.get('method', 'ADDITION').upper()}\n"
-            yield log_acc, "", f"Merging: {p_name}"
+            clean_json = re.sub(r'//.*', '', recipe_json)
+            recipe_dict = json.loads(clean_json)
             
-            engine.process_pass(step, global_mult)
+            recipe_dict['paths'] = recipe_dict.get('paths', {})
+            recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
+            recipe_dict['paths']['title'] = recipe_dict['paths'].get('title', recipe_slug)
             
-            last_pass = engine.summary_data[-1]
-            peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
-            log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}{peak_str}\n"
-            yield log_acc, "", f"Merging: {p_name}"
+            # Initialize Engine
+            engine = ActionMasterEngine(recipe_dict)
 
-        # 3. SAVE MASTER (SSD)
-        progress(0.8, desc="Exporting to SSD...")
-        log_acc += engine.get_final_summary_string() + "\n"
-        log_acc += f"💾 EXPORT: Writing 28GB Master to SSD: {temp_path}...\n"
-        log_acc += "⚠️ UI may pause briefly during I/O write...\n"
-        yield log_acc, "", "Exporting to SSD..."
-        
-        # This call now clears RAM internally in engine.py as discussed
-        engine.save_master(temp_path) 
-        
-        # Integrity Check
-        if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1e9:
-            error_msg = f"❌ SAVE ERROR: Master file missing or corrupt at {temp_path}"
-            log_acc += error_msg + "\n"
-            yield log_acc, "", "Save Failed"
-            return "🛑 Save Failure", "", "Error"
+            # --- VALIDATION HEADER ---
+            mismatches = engine.get_compatibility_report()
+            border = "=" * 60
+            header = f"\n{border}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{border}\n"
             
-        log_acc += f"✅ MASTER SAVED: {os.path.getsize(temp_path)/1e9:.1f} GB\n"
-        yield log_acc, "", "Export Complete"
+            if mismatches:
+                header += f"❌ CONFLICT: {len(mismatches)} LoRA(s) mismatch noise levels!\n"
+                for m in mismatches: header += f"   - [WARN] {m}\n"
+                header += f"{border}\n⚠️  PROCEEDING WITH CAUTION...\n\n"
+            else:
+                header += "✅ ALL SYSTEMS CLEAR: Alignment Verified.\n"
+                header += f"{border}\n\n"
+
+            log_acc += header
+            yield log_acc, "", "Merging Layers..."
+
+            # 2. MERGING LOOP
+            pipeline = recipe_dict.get('pipeline', [])
+            global_mult = recipe_dict['paths'].get('global_weight_factor', 1.0)
+
+            for i, step in enumerate(pipeline):
+                p_name = step.get('pass_name', f"Pass {i+1}")
+                progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
+                
+                log_acc += f"▶️ {p_name.upper()} | Mode: {step.get('method', 'ADDITION').upper()}\n"
+                yield log_acc, "", f"Merging: {p_name}"
+                
+                engine.process_pass(step, global_mult)
+                
+                last_pass = engine.summary_data[-1]
+                peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
+                log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}{peak_str}\n"
+                yield log_acc, "", f"Merging: {p_name}"
+
+            # 3. SAVE MASTER (SSD)
+            progress(0.8, desc="Exporting to SSD...")
+            log_acc += engine.get_final_summary_string() + "\n"
+            log_acc += f"💾 EXPORT: Writing 28GB Master to SSD: {temp_path}...\n"
+            log_acc += "⚠️ UI may pause briefly during I/O write...\n"
+            yield log_acc, "", "Exporting to SSD..."
+            
+            engine.save_master(temp_path) 
+            
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1e9:
+                error_msg = f"❌ SAVE ERROR: Master file missing or corrupt at {temp_path}"
+                log_acc += error_msg + "\n"
+                yield log_acc, "", "Save Failed"
+                return "🛑 Save Failure", "", "Error"
+                
+            log_acc += f"✅ MASTER SAVED: {os.path.getsize(temp_path)/1e9:.1f} GB\n"
+            yield log_acc, "", "Export Complete"
 
         # 4. QUANTIZATION / EXPORT (RAM Disk)
         torch.cuda.empty_cache()
         gc.collect()
 
-        # FIX: Matches the exact string in the Radio choices
         if q_format != "None (FP16 Master)":
             if "GGUF_" in q_format:
                 q_type = q_format.replace("GGUF_", "")
@@ -221,7 +229,6 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 final_path = os.path.join(final_dir, final_name)
                 
                 yield log_acc + f"🔨 GGUF: {q_type} -> {final_path}\n", "", f"GGUF {q_type}..."
-                # FIX: Ensure --outtype is passed correctly
                 cmd = ["python", "convert.py", "--path", temp_path, "--dst", final_path, "--outtype", q_type]
             
             else:
@@ -230,20 +237,17 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 
                 yield log_acc + f"🔨 PIP PACKAGE: {q_format.upper()} -> {final_path}\n", "", f"Quantizing {q_format}..."
                 
-                # Use --wan flag to protect time embeddings
                 cmd = ["convert_to_quant", "-i", temp_path, "--comfy_quant", "--wan"]
                 
                 if q_format == "int8":
                     cmd += ["--int8", "--block_size", "128"]
                 elif q_format == "nvfp4":
                     cmd += ["--nvfp4"]
-                # fp8 is default for convert_to_quant
 
             subprocess.run(cmd, check=True)
             log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
             yield log_acc, final_path, "Process Finished"
         else:
-            # FIX: Properly handle the path for "None" selection
             yield log_acc + "✅ MASTER FP16 READY ON SSD.\n", temp_path, "Finished"
 
     except KeyboardInterrupt:
@@ -252,7 +256,6 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
         yield log_acc, "", "Critical Error"
     finally:
-        # Ensure we always reset the active process global
         global active_process
         active_process = None
 
