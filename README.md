@@ -4,7 +4,22 @@ DaSiWa WAN 2.2 Master is a high-performance industrial toolkit designed for merg
 
 ## ✨ Key Features
 
-🧬 Action-Master Engine: Advanced JSON-based merging logic. Supports TIES-Additive hybrid merging and multi-pass LoRA integration.
+🧬 Action-Master Engine: Adaptive Injection Pipeline - The Action-Master Engine is a high-precision merging framework specifically architected for Wan 2.2 (14B). It moves beyond simple weight stacking by treating LoRAs as conceptual data streams that are filtered, gated, and injected based on the base model’s existing knowledge.
+
+**Key Features of the New Approach:**
+
+- Dual-Path Processing: * addition: High-fidelity raw transfer for Distilled or Foundation LoRAs where 100% precision is required.
+    - `injection` Activates the custom Adaptive Noise Gate and Dynamic Limiter for complex concept integration.
+
+- Adaptive Knowledge Injection: The engine automatically detects "Conceptual Gaps." If the LoRA introduces a new texture (like NSFW fluids or specific anatomy) that the   base model lacks, it lowers the sensitivity gate to allow deep carving of the new weights.
+
+- Intelligent Noise Gating: For established concepts (lighting, style, generic motion), the engine applies a strict gate to strip away "latent chatter," ensuring the merge remains sharp and artifact-free.
+
+- Saturation Guard (Dynamic Limiter): Prevents "deep-fried" or over-saturated videos by monitoring weight variance and capping peak intensities before they destabilize the 14B architecture.
+
+- Universal Key Mapping: A normalized "slug-based" matching system that allows seamless merging regardless of whether the LoRAs were trained with dots, underscores, or different naming conventions.
+
+- Real-Time Injection Summary: Provides a CLI-based health report for every pass, calculating Knowledge Injection % (Sparsity) and Total Model Shift to ensure stability before final quantization.
 
 📦 GGUF MoE Specialist: Native Wan 2.2 GGUF quantization with Self-Healing 5D Expert Injection to preserve video tensor shapes and prevent "gray-screen" outputs.
 

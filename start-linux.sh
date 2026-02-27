@@ -75,7 +75,7 @@ uv pip install --refresh -r requirements.txt
 
 echo "💎 Installing FP Quantization Tools..."
 # Install silveroxides' quantizer
-uv pip install --refresh git+https://github.com/silveroxides/convert_to_quant.git@main#egg=convert_to_quant --no-deps
+uv pip install --refresh git+https://github.com/silveroxides/convert_to_quant.git@main#egg=convert_to_quant --no-deps --force-reinstall
 
 echo "🍳 Installing Comfy Kitchen [CUBLAS]..."
 # Install comfy-kitchen with cublas support for NVFP4 (+Blackwell)

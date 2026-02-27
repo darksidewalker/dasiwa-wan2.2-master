@@ -122,23 +122,37 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             log_acc += f"♻️ CACHE HIT: Reusing {cache_name}\n"
             yield log_acc, temp_path
         else:
-            # 3. MERGING PASSES
             pipeline = recipe_dict.get('pipeline', [])
             for i, step in enumerate(pipeline):
                 p_name = step.get('pass_name', f"Pass {i+1}")
+                method = step.get('method', 'addition').upper()
+                
                 progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
-                log_acc += f"▶️ {p_name.upper()}: Merging Tensors...\n"
+                
+                # This logic just ensures the log looks nice
+                display_method = "KNOWLEDGE INJECTION" if method == "INJECTION" else "RAW ADDITION"
+                log_acc += f"▶️ {p_name.upper()} | Mode: {display_method}\n"
+                yield log_acc, ""
+                
                 engine.process_pass(step, 1.0)
+                
+                # Grab the stats from the engine's last recorded pass
+                last_pass = engine.summary_data[-1]
+                log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}\n"
                 yield log_acc, ""
 
-            # STAGE 4: TENSOR PATTERN PREP
-            progress(0.8, desc="Saving Master...")
-            
-            # This is the line to change for the GUI:
-            log_acc += f"💾 EXPORT: Saving high-precision Master (BF16) to SSD...\n"
-            
+            # --- THE BIG REVEAL ---
+            # Generate the ASCII table we built in the engine
+            progress(0.8, desc="Finalizing Report...")
+            summary_table = engine.get_final_summary_string() 
+            log_acc += summary_table + "\n"
+            yield log_acc, "" # Update terminal with the full table
+
+            # Save step
+            log_acc += f"💾 EXPORT: Saving Master BF16 to SSD...\n"
+            yield log_acc, ""
             engine.save_master(temp_path)
-            log_acc += f"✅ INTERMEDIATE SAVED: {cache_name}\n"
+            log_acc += f"✅ MASTER SAVED: {cache_name}\n"
             yield log_acc, temp_path
         
         # 5. QUANTIZATION
@@ -165,18 +179,30 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 yield log_acc, temp_path
         active_process.wait()
 
-        # 7. GGUF EXPERT RE-INJECTION
+        # 7. GGUF EXPERT RE-INJECTION (Safe-Write Logic)
         if is_gguf and active_process.returncode == 0:
             log_acc += "💉 Stage 7: Re-injecting 5D MoE Experts...\n"
-            fix_cmd = ["python", "fix_5d_tensors.py", "--src", final_output_path, "--dst", final_output_path, "--overwrite"]
-            subprocess.run(fix_cmd)
-            log_acc += "✅ EXPERTS RESTORED.\n"
-
-        if active_process.returncode == 0:
-            log_acc += f"✅ SUCCESS: {os.path.basename(final_output_path)} created.\n"
-            if auto_move: log_acc += f"{sync_ram_to_ssd(final_output_path)}\n"
-        else:
-            log_acc += f"❌ FAILED: Exit Code {active_process.returncode}\n"
+            progress(0.95, desc="Fixing 5D Tensors...")
+            
+            # Create a temporary path for the fixed file
+            fixed_output_path = final_output_path.replace(".gguf", "_fixed.gguf")
+            
+            fix_cmd = [
+                "python", "fix_5d_tensors.py", 
+                "--src", final_output_path, 
+                "--dst", fixed_output_path,
+                "--overwrite"
+            ]
+            
+            fix_proc = subprocess.run(fix_cmd, capture_output=True, text=True)
+            
+            if fix_proc.returncode == 0:
+                # Swap files: Move fixed to final, remove the broken original
+                os.replace(fixed_output_path, final_output_path)
+                log_acc += "✅ EXPERTS RESTORED & VERIFIED.\n"
+            else:
+                log_acc += f"❌ EXPERT FIX FAILED: {fix_proc.stderr}\n"
+                log_acc += "⚠️ Model may be unstable in ComfyUI.\n"
 
         active_process = None
         yield log_acc, final_output_path

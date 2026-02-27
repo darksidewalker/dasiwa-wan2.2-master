@@ -1,66 +1,65 @@
 {
   "paths": {
-    "base_model": "models/MODEL.safetensors",
-    "lora_dir": "PATH_TO_YOUR_LORAS",
-    "output_prefix": "models/MODEL_OUT.safetensors",
-    "global_weight_factor": 0.92,
+    "base_model": "Wan2.2_14B_Base.safetensors",
+    "lora_dir": "loras/wan22",
+    "output_prefix": "Wan22_Master_V1",
+    "global_weight_factor": 1.0,
     "save_interval": 0
   },
   "pipeline": [
     {
-      "pass_name": "Engine",
-      "description": "Engine Integration",
+      "pass_name": "Engine_Core",
+      "method": "addition",
+      "description": "HINT: Use 'addition' for Distilled/Foundation LoRAs to keep 100% precision without gating.",
       "density": 1.0,
-      "block_shield": false,
       "features": [
         {
-          "file": "distilled-lora.safetensors",
-          "weight": 1.6,
-          "modify_skeleton": true
+          "file": "wan2.2_distilled_engine.safetensors",
+          "weight": 1.2
+        }
+      ]
+    },
+    {
+      "pass_name": "Anatomy_Injection",
+      "method": "injection",
+      "description": "HINT: Use 'injection' for NSFW/Fluids. The Adaptive Gate (0.4) allows new concepts to carve into the model.",
+      "density": 0.90,
+      "features": [
+        {
+          "file": "wan22_cum_v1.safetensors",
+          "weight": 0.45
         },
         {
-          "file": "any-engine-lora.safetensors",
-          "weight": 1.0,
-          "modify_skeleton": true
+          "file": "wan22_anatomy_fix.safetensors",
+          "weight": 0.3
         }
       ]
     },
     {
-      "pass_name": "Physics",
-      "description": "Stability Pass",
-      "density": 0.95,
-      "block_shield": false,
+      "pass_name": "Motion_Physics",
+      "method": "injection",
+      "description": "HINT: 'injection' here acts as a noise-gate, filtering out conflicting motion data from multiple LoRAs.",
+      "density": 0.85,
       "features": [
         {
-          "file": "any-stabilit-lora.safetensors",
-          "weight": 0.5,
-          "modify_skeleton": true
+          "file": "wan22_fluid_physics.safetensors",
+          "weight": 0.6
+        },
+        {
+          "file": "wan22_extreme_motion.safetensors",
+          "weight": 0.5
         }
       ]
     },
     {
-      "pass_name": "Motion",
-      "description": "Motion Pass",
+      "pass_name": "Aesthetic_Refine",
+      "method": "injection",
+      "description": "HINT: For concepts the model already knows (lighting/style), 'injection' uses a strict gate (1.8) to prevent blur.",
       "density": 0.95,
-      "block_shield": false,
       "features": [
         {
-          "file": "any-motion-lora.safetensors",
-          "weight": 0.5,
-          "modify_skeleton": true
-        }
-      ]
-    },
-    {
-      "pass_name": "Aesthetic",
-      "description": "Aeathetics Pass",
-      "density": 0.95,
-      "block_shield": false,
-      "features": [
-        {
-          "file": "any-visual-lora.safetensors",
-          "weight": 0.5,
-          "modify_skeleton": true
+          "file": "wan22_cinematic_style.safetensors",
+          "weight": 0.4
         }
       ]
     }
