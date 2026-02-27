@@ -28,20 +28,26 @@ class ActionMasterEngine:
         return avg_mag
 
     def find_lora_keys(self, lora_sd, target_key):
-        # Anchor point
+        # 1. Standardize the anchor (e.g., 'blocks.0.cross_attn.k')
         clean_target = target_key.replace("diffusion_model.", "").replace(".weight", "")
-        # Check if we are targeting a 2D weight matrix (most common) or a 1D bias
         is_2d_target = len(self.base_dict[target_key].shape) == 2
 
-        # Suffix pairs from your 3 examples
+        # 2. Create the Underscore version for the 4th type (e.g., 'blocks_0_cross_attn_k')
+        underscore_target = clean_target.replace(".", "_")
+
         pairs = [
             (".lora_B", ".lora_A"),       # Example 1 & 2
             (".lora_up", ".lora_down"),   # Example 3
+            ("_lora_up", "_lora_down"),   # 4th Type (Example 4)
+            (".lora_up.weight", ".lora_down.weight") # PEFT / Diffusers full names
         ]
 
-        # Priority 1: Find Matrix Pairs (A/B or Up/Down)
         for k in lora_sd.keys():
-            if f"{clean_target}." in k or k.startswith(f"{clean_target}."):
+            # Check for Dot-style OR Underscore-style match
+            # The 'lora_unet__' prefix is common in Kohya, so we check if the path exists in k
+            if clean_target in k or underscore_target in k:
+                
+                # Priority: Find Matrix Pairs
                 for up_suf, down_suf in pairs:
                     if up_suf in k:
                         up_k = k
@@ -49,11 +55,11 @@ class ActionMasterEngine:
                         if down_k in lora_sd:
                             return up_k, down_k, "matrix"
         
-        # Priority 2: Fallback to Vectors ONLY if the target is also a vector/bias
+        # Fallback for vectors/alphas
         if not is_2d_target:
             for k in lora_sd.keys():
-                if f"{clean_target}." in k or k.startswith(f"{clean_target}."):
-                    if any(x in k for x in [".diff", ".alpha", ".bias"]):
+                if clean_target in k or underscore_target in k:
+                    if any(x in k for x in [".diff", ".alpha", ".bias", "_alpha"]):
                         return k, None, "vector"
                     
         return None, None, None
