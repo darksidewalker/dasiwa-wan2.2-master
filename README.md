@@ -20,7 +20,7 @@ DaSiWa WAN 2.2 Master is a high-performance industrial toolkit designed for merg
 
 Ensure you have uv installed for high-speed dependency management:
 Bash
-``
+```
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ``` 
 
