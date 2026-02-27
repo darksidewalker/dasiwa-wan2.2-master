@@ -22,44 +22,85 @@ class ActionMasterEngine:
         self.role_label = "MOTION (14B High Noise)" if self.is_motion_base else "REFINER (14B Low Noise)"
         print(f"🛰️ Engine: {self.role_label} Active.")
 
+    def validate_recipe_compatibility(self):
+        print(f"🛡️ VALIDATING RECIPE: Ensuring LoRA compatibility for {self.role_label}...")
+        
+        # Determine the "Forbidden" keyword based on the active model
+        forbidden = "low" if self.is_motion_base else "high"
+        required = "high" if self.is_motion_base else "low"
+        
+        issues = []
+        for step in self.recipe.get('pipeline', []):
+            for feature in step.get('features', []):
+                filename = feature['file'].lower()
+                
+                # Check for explicit mismatches
+                if forbidden in filename:
+                    issues.append(f"❌ MISMATCH: LoRA '{feature['file']}' contains '{forbidden}' but engine is {self.role_label}.")
+                
+                # Check for missing expected labels (Optional Warning)
+                if required not in filename:
+                    # We don't block the merge, just notify
+                    pass 
+
+        if issues:
+            print("\n".join(issues))
+            confirm = input("\n⚠️ Critical compatibility issues found. Continue anyway? (y/n): ")
+            if confirm.lower() != 'y':
+                print("🛑 Operation aborted by user.")
+                exit()
+        else:
+            print("✅ Recipe validation passed: No noise-level conflicts detected.")
+    
+    def get_compatibility_report(self):
+        forbidden = "low" if self.is_motion_base else "high"
+        mismatches = []
+        
+        for step in self.recipe.get('pipeline', []):
+            for feature in step.get('features', []):
+                fname = feature['file'].lower()
+                if forbidden in fname:
+                    mismatches.append(feature['file'])
+        
+        return mismatches # Returns a list of bad files
+
     def scan_lora_density(self, lora_sd):
         mags = [v.abs().mean().item() for k, v in lora_sd.items() if "weight" in k or ".diff" in k]
         avg_mag = sum(mags) / len(mags) if mags else 0
         return avg_mag
 
     def find_lora_keys(self, lora_sd, target_key):
-        # 1. Standardize the anchor (e.g., 'blocks.0.cross_attn.k')
         clean_target = target_key.replace("diffusion_model.", "").replace(".weight", "")
         is_2d_target = len(self.base_dict[target_key].shape) == 2
-
-        # 2. Create the Underscore version for the 4th type (e.g., 'blocks_0_cross_attn_k')
         underscore_target = clean_target.replace(".", "_")
 
+        # Expanded pairs to handle mixed dot/underscore separators
         pairs = [
-            (".lora_B", ".lora_A"),       # Example 1 & 2
-            (".lora_up", ".lora_down"),   # Example 3
-            ("_lora_up", "_lora_down"),   # 4th Type (Example 4)
-            (".lora_up.weight", ".lora_down.weight") # PEFT / Diffusers full names
+            (".lora_B", ".lora_A"),
+            (".lora_up", ".lora_down"),
+            ("_lora_up", "_lora_down"),
+            (".lora_up.weight", ".lora_down.weight"),
+            # Safety for Kohya-style mixed naming
+            ("_lora_B", "_lora_A"), 
         ]
 
         for k in lora_sd.keys():
             # Check for Dot-style OR Underscore-style match
-            # The 'lora_unet__' prefix is common in Kohya, so we check if the path exists in k
             if clean_target in k or underscore_target in k:
-                
-                # Priority: Find Matrix Pairs
                 for up_suf, down_suf in pairs:
                     if up_suf in k:
                         up_k = k
+                        # Dynamic suffix replacement to keep the prefix intact
                         down_k = k.replace(up_suf, down_suf)
                         if down_k in lora_sd:
                             return up_k, down_k, "matrix"
         
-        # Fallback for vectors/alphas
+        # Fallback for vectors/alphas/biases
         if not is_2d_target:
             for k in lora_sd.keys():
                 if clean_target in k or underscore_target in k:
-                    if any(x in k for x in [".diff", ".alpha", ".bias", "_alpha"]):
+                    # Added '_alpha' and '.bias' coverage
+                    if any(x in k for x in [".diff", ".alpha", ".bias", "_alpha", "_bias"]):
                         return k, None, "vector"
                     
         return None, None, None
@@ -197,26 +238,28 @@ class ActionMasterEngine:
     def apply_delta(self, target_key, delta):
         base = self.base_dict[target_key]
         
-        # Guard: Ensure we aren't trying to add a 1D vector to a 2D matrix
-        if delta.ndim != base.ndim:
-            return False 
+        # 1. THE SILENT GUARD: Filter out specialized layers (Convnd) 
+        # that LoRAs often flatten. This stops the log spam.
+        if base.ndim > 2 and delta.ndim <= 2:
+            return False # Exit silently, no log entry created
 
-        # Handle Transposition (Some LoRAs are saved as [Rank, Dim] vs [Dim, Rank])
+        # 2. SHAPE CORRECTION (Standard 2D Weights)
         if delta.numel() == base.numel():
             delta = delta.reshape(base.shape)
-        elif delta.t().shape == base.shape:
+        elif delta.ndim == 2 and delta.t().shape == base.shape:
             delta = delta.t()
         else:
+            # ONLY log if it's a real anomaly (e.g. two 2D layers that don't match)
+            print(f"⚠️ SHAPE MISMATCH at {target_key}: {delta.shape} vs {base.shape}")
             return False
 
-        # Execute Merge: Delta (from GPU) + Base (on CPU)
+        # 3. HIGH-PRECISION ADDITION (CPU Handshake)
         with torch.no_grad():
-            # Move delta to CPU for the math to avoid Device Mismatch
-            # Use float32 for the calculation to maintain "Master" quality
-            merged = base.to(torch.float32) + delta.to("cpu", dtype=torch.float32)
+            # Move delta to CPU to meet the 14B base
+            updated_weight = base.to(torch.float32) + delta.to("cpu", dtype=torch.float32)
             
-            # Cast back to the base model's native precision (BF16/FP16)
-            self.base_dict[target_key] = merged.to(base.dtype)
+            # Cast back to BF16/FP16 and store
+            self.base_dict[target_key] = updated_weight.to(base.dtype)
             
         return True
 
