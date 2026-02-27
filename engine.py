@@ -159,17 +159,24 @@ class ActionMasterEngine:
         return "\n".join(lines)
 
     def get_metadata_string(self, quant_label="None (Raw Weights)"):
+        """Generates the branded summary with dynamic precision mapping."""
         sample_key = self.base_keys[0]
         dtype = self.base_dict[sample_key].dtype
-        prec = "BF16" if dtype == torch.bfloat16 else ("FP16" if dtype == torch.float16 else "FP32")
+        
+        # Internal math precision
+        internal_prec = "BF16" if dtype == torch.bfloat16 else ("FP16" if dtype == torch.float16 else "FP32")
+        
+        # Clean up the export label for the header
+        export_prec = quant_label.replace("GGUF_", "") if "GGUF_" in quant_label else quant_label
         
         header = (
-            f"Title: {self.paths.get('title', 'DaSiWa Master')}\n"
+            f"Title: {self.paths.get('title', 'Dasiwa Master')}\n"
             f"Type: {self.paths.get('type', 'Wan 2.2 14B')}\n"
             f"Resolution: {self.paths.get('resolution', '960x960')}\n"
-            f"Internal Precision: {prec}\n"
-            f"Quantization: {quant_label}\n"
+            f"Internal Math: {internal_prec}\n"
+            f"Export Precision: {export_prec}\n"
         )
+        
         branding = "\n🚀 Made with DaSiWa WAN 2.2 Master by Darksidewalker"
         return f"{header}\n{self.get_final_summary_string()}{branding}"
 

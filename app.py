@@ -155,28 +155,37 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
 
         # 5. QUANTIZATION
         progress(0.9, desc=f"Quantizing to {q_format}")
-        # ... (Existing Quant logic) ...
         
-        # --- NEW: Inject Summary into GGUF if applicable ---
+        # Ensure path consistency across both branches
+        recipe_slug = recipe_name.replace(".json", "")
+        out_prefix = recipe_dict['paths'].get('output_prefix', 'Wan22_Merge')
+        output_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
+        
+        # Generate the branded metadata block (Same logic as engine.py)
+        final_meta_block = engine.get_metadata_string(quant_label=q_format)
+
         if is_gguf:
             q_type = q_format.replace("GGUF_", "")
-            final_output_path = os.path.join(output_dir, f"{out_prefix}_{q_type}.gguf")
+            final_output_path = os.path.join(output_dir, f"{out_prefix}_{recipe_slug}_{q_type}.gguf")
             
-            # Get the branded text block for GGUF
-            gguf_description = engine.get_metadata_string(quant_label=q_type)
-            
+            # GGUF handles metadata injection perfectly via command line
             cmd = [
                 "python", "convert.py", 
                 "--path", temp_path, 
                 "--dst", final_output_path,
-                "--metadata", f"general.description={gguf_description}" # Pass full table to GGUF
+                "--metadata", f"general.description={final_meta_block}"
             ]
-            log_acc += "📦 GGUF: Converting to F16 (Experts will be extracted)...\n"
+            log_acc += f"📦 GGUF: Converting to {q_type} with embedded metadata...\n"
         else:
+            # Native Safetensors (fp8, nvfp4, int8)
             final_output_path = os.path.join(output_dir, f"{out_prefix}_{recipe_slug}_{q_format}.safetensors")
+            
             fmt_flag = ["--nvfp4"] if q_format == "nvfp4" else (["--int8"] if q_format == "int8" else [])
+            
+            # COMMS: Native quantizers usually create a fresh header. 
+            # We print the summary to the log so the user can copy-paste it if needed.
             cmd = ["convert_to_quant", "-i", temp_path, "-o", final_output_path, "--comfy_quant", "--wan"] + fmt_flag
-            log_acc += "💎 NATIVE: Using convert_to_quant --wan preset...\n"
+            log_acc += f"💎 NATIVE: Quantizing to {q_format} (Check terminal for final summary table)...\n"
 
         # 6. EXECUTION & LOG STREAMING
         active_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -185,6 +194,27 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 log_acc += f"  [QUANT] {line}"
                 yield log_acc, temp_path
         active_process.wait()
+
+        # --- METADATA RESTORATION FOR NATIVE MODELS ---
+        if not is_gguf and active_process.returncode == 0:
+            log_acc += "📝 Injecting Master Metadata into Native Quant...\n"
+            yield log_acc, temp_path
+            try:
+                # Load the quantized weights and save them back with our engine's metadata
+                from safetensors.torch import load_file, save_file
+                
+                # Note: We use the block we generated earlier in the pipeline
+                weights = load_file(final_output_path)
+                custom_meta = {
+                    "modelspec.architecture": "wan_2.2_video",
+                    "comment": final_meta_block,
+                    "dasiwa_summary": final_meta_block
+                }
+                save_file(weights, final_output_path, metadata=custom_meta)
+                log_acc += "✅ Native Metadata Verified.\n"
+            except Exception as meta_err:
+                log_acc += f"⚠️ Metadata injection skipped: {str(meta_err)}\n"
+            yield log_acc, temp_path
 
         # 7. GGUF EXPERT RE-INJECTION (Safe-Write Logic)
         if is_gguf and active_process.returncode == 0:
