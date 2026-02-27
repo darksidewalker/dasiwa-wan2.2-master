@@ -23,10 +23,6 @@ class ActionMasterEngine:
         self.base_dict = load_file(base_path)
         self.base_keys = list(self.base_dict.keys())
         print(f"🛰️ Engine: {self.role_label} Active.")
-        
-        self.is_motion_base = "high" in base_path.lower()
-        self.role_label = "MOTION (14B High Noise)" if self.is_motion_base else "REFINER (14B Low Noise)"
-        print(f"🛰️ Engine: {self.role_label} Active.")
 
     def validate_recipe_compatibility(self):
         print(f"🛡️ VALIDATING RECIPE: Ensuring LoRA compatibility for {self.role_label}...")
@@ -319,27 +315,19 @@ class ActionMasterEngine:
 
     def save_master(self, path):
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        
-        # 1. Prepare Metadata
         full_log = self.get_metadata_string()
         custom_metadata = {"comment": full_log, "dasiwa_summary": full_log}
         
         try:
-            print(f"💾 EXPORT: Writing {os.path.basename(path)}... [Do not interrupt]")
-            # Directly save self.base_dict. It is already on CPU due to your 
-            # high-precision handshake logic in apply_delta.
-            # We use contiguous() only if necessary to save memory.
-            save_file(self.base_dict, path, metadata=custom_metadata)
-            print(f"✅ SUCCESS: High-Precision Master saved to {path}")
-        except KeyboardInterrupt:
-            print("\n❌ SAVE INTERRUPTED: The file at " + path + " is likely CORRUPTED.")
-            raise
-        except Exception as e:
-            print(f"❌ EXPORT FAILED: {str(e)}")
+            print(f"💾 EXPORT: Writing {os.path.basename(path)} to SSD...")
+            # Ensure tensors are contiguous for a faster, safer write
+            save_file({k: v.contiguous() for k, v in self.base_dict.items()}, 
+                      path, metadata=custom_metadata)
+            print(f"✅ SUCCESS: Master saved to {path}")
         finally:
-            # Clear everything to prevent freezing the rest of the pipeline
+            # THIS PREVENTS THE FREEZE: Drop the 28GB from RAM immediately
+            self.base_dict = None
             self._cleanup()
-            
         return path
 
     def _cleanup(self):
