@@ -234,69 +234,74 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         yield log_acc, "", "Critical Error"
 
 # --- 5. UI CONSTRUCTION (Gradio 6.0 Compliant) ---
-with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
+with gr.Blocks(title="DaSiWa WAN 2.2 Master", css=CSS_STYLE) as demo:
     with gr.Row():
-        with gr.Column(scale=4):
-            gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**Gradio 6.0 Stable | 14B High-Precision MoE Pipeline**")
-        with gr.Column(scale=2, elem_classes=["vitals-card"]):
-            vitals_box = gr.Textbox(label="Health", value=get_sys_info(), lines=3, interactive=False)
-            # Automatic timer for system stats
-            gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
-        with gr.Column(scale=1):
-            with gr.Group(elem_classes="vitals-card"): # Use gr.Group instead of gr.Div
-                gr.Markdown("### ⚡ System Status")
-                pipeline_status = gr.Label(label="Current Stage", value="Idle")
+        with gr.Column(scale=3):
+            gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**14B High-Precision MoE Pipeline**")
         
-        # NEW: Dedicated Progress Bar Area
-        pipeline_progress = gr.Label(label="Pipeline Stage", value="Idle")
+        # Centralized Health & Status
+        with gr.Column(scale=2):
+            with gr.Group(elem_classes="vitals-card"):
+                vitals_box = gr.Textbox(label="System Health", value=get_sys_info(), lines=3, interactive=False)
+                gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
+        
+        with gr.Column(scale=2):
+            with gr.Group(elem_classes="vitals-card"):
+                pipeline_status = gr.Label(label="Current Stage", value="Idle")
+                # The progress bar component is usually internal to gr.Progress, 
+                # but we use this Label as a persistent visual anchor.
 
     with gr.Row():
-        with gr.Column(scale=1):
+        # LEFT: Control Panel
+        with gr.Column(scale=2):
             with gr.Group():
-                base_dd = gr.Dropdown(label="Base Component")
+                gr.Markdown("### 📂 Assets")
+                base_dd = gr.Dropdown(label="Base Model")
                 recipe_dd = gr.Dropdown(label="Active Recipe")
-                val_status_display = gr.Markdown("### 🛡️ Status: No Recipe Selected") # New Component
-                refresh_btn = gr.Button("🔄 Refresh Assets")
+                val_status_display = gr.Markdown("### 🛡️ Status: No Recipe Selected")
+                refresh_btn = gr.Button("🔄 Refresh Assets", size="sm")
             
             with gr.Group():
+                gr.Markdown("### ⚙️ Export Configuration")
                 quant_select = gr.Radio(
                     choices=[
-                        "fp8", "nvfp4", "int8", 
-                        "GGUF_Q8_0", 
-                        "GGUF_Q6_K", 
-                        "GGUF_Q5_K_M", 
-                        "GGUF_Q4_K_M", 
-                        "GGUF_Q3_K_L", 
-                        "GGUF_Q2_K"
+                        "None (FP16 Master)", "GGUF_Q8_0", "GGUF_Q6_K", 
+                        "GGUF_Q5_K_M", "GGUF_Q4_K_M", "GGUF_Q2_K"
                     ], 
-                    value="fp8", 
-                    label="Export Format"
+                    value="None (FP16 Master)", 
+                    label="Target Format"
                 )
                 auto_move_toggle = gr.Checkbox(label="🚀 Move to SSD on Success", value=False)
-                start_btn = gr.Button("🔥 START PIPELINE", variant="primary")
-                stop_btn = gr.Button("🛑 STOP", variant="stop")
+                
+            with gr.Row():
+                start_btn = gr.Button("🔥 START", variant="primary", scale=2)
+                stop_btn = gr.Button("🛑 STOP", variant="stop", scale=1)
             
+            sync_trigger = gr.Button("📤 Manual Move to SSD", variant="secondary")
             last_path_state = gr.State("")
-            sync_trigger = gr.Button("📤 Manual Move to SSD")
 
-        with gr.Column(scale=2):
+        # RIGHT: Feed & Code
+        with gr.Column(scale=5):
             with gr.Tabs():
                 with gr.Tab("💻 Terminal Feed"):
-                    terminal_box = gr.Textbox(lines=25, interactive=False, elem_id="terminal")
+                    terminal_box = gr.Textbox(lines=28, interactive=False, elem_id="terminal", show_label=False)
                 with gr.Tab("📝 Recipe Editor"):
-                    recipe_editor = gr.Code(language="json", lines=25)
+                    recipe_editor = gr.Code(language="json", lines=28)
 
     # --- EVENT BINDINGS ---
     demo.load(list_files, outputs=[base_dd, recipe_dd])
     refresh_btn.click(list_files, outputs=[base_dd, recipe_dd])
+    
+    # Validator logic (Updated to check recipe contents)
     recipe_dd.change(load_recipe_text, inputs=[recipe_dd], outputs=[recipe_editor])
     recipe_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
     base_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
     
+    # Start Pipeline (3 Outputs to match run_pipeline yield)
     start_btn.click(
         fn=run_pipeline, 
         inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], 
-        outputs=[terminal_box, last_path_state, pipeline_progress]
+        outputs=[terminal_box, last_path_state, pipeline_status]
     )
 
     stop_btn.click(fn=terminate_pipeline, outputs=[terminal_box])
