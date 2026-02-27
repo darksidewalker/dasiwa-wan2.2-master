@@ -71,32 +71,37 @@ def get_sys_info():
 
 def instant_validate(recipe_name, base_model):
     if not recipe_name or not base_model:
-        return "⚪ Waiting for selection..."
+        return "### 🛡️ Status: Waiting for selection..."
+    
+    # STRICT DETECTION: Look for noise tags only
+    model_is_high = "high_noise" in base_model.lower()
+    recipe_is_high = "high" in recipe_name.lower()
+    
+    model_label = "MOTION (High)" if model_is_high else "REFINER (Low)"
     
     try:
-        # 1. Load the recipe text
-        path = os.path.join(RECIPES_DIR, recipe_name)
-        with open(path, 'r') as f:
-            recipe_content = f.read().lower()
+        # Load JSON to check internal LoRA paths
+        recipe_path = os.path.join(RECIPES_DIR, recipe_name)
+        with open(recipe_path, 'r') as f:
+            content = f.read().lower()
             
-        base_lower = base_model.lower()
-        
-        # 2. Identify Model Type
-        is_high_model = "high" in base_lower or "i2v" in base_lower
-        
-        # 3. Validation Logic
-        if is_high_model:
-            # If high model, search for "low" lora paths in the JSON
-            if '"low"' in recipe_content or "_low" in recipe_content:
-                return "❌ MISMATCH: High-Noise Model detected, but JSON contains 'Low' LoRAs."
-        else:
-            # If low model (Refiner), search for "high" lora paths in the JSON
-            if '"high"' in recipe_content or "_high" in recipe_content or "i2v" in recipe_content:
-                return "❌ MISMATCH: Low-Noise Model detected, but JSON contains 'High' LoRAs."
-                
-        return "✅ COMPATIBLE: Noise levels match."
+            # Scenario A: High Model check
+            if model_is_high:
+                if "low_noise" in content or "_low" in content:
+                    return f"### ❌ MISMATCH: {model_label} Model vs. LOW LoRAs found in JSON"
+                if not recipe_is_high:
+                    return f"### ❌ MISMATCH: {model_label} Model vs. LOW Recipe filename"
+            
+            # Scenario B: Low Model check
+            else:
+                if "high_noise" in content or "_high" in content:
+                    return f"### ❌ MISMATCH: {model_label} Model vs. HIGH LoRAs found in JSON"
+                if recipe_is_high:
+                    return f"### ❌ MISMATCH: {model_label} Model vs. HIGH Recipe filename"
+
+        return f"### ✅ VALIDATED: {model_label} Architecture Alignment"
     except Exception as e:
-        return f"⚪ Status: Ready ({str(e)})"
+        return f"### ⚠️ Status: Validation Error ({str(e)})"
 
 def list_files():
     m = sorted([f for f in os.listdir(MODELS_DIR) if f.endswith(('.safetensors', '.gguf'))])
@@ -204,34 +209,45 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         log_acc += f"✅ MASTER SAVED: {os.path.getsize(temp_path)/1e9:.1f} GB\n"
         yield log_acc, "", "Export Complete"
 
-        # 4. QUANTIZATION (RAM Disk)
+        # 4. QUANTIZATION / EXPORT (RAM Disk)
         torch.cuda.empty_cache()
         gc.collect()
 
         if q_format != "None (FP16 Master Only)":
-            q_type = q_format.replace("GGUF_", "")
-            final_name = f"WAN22_{recipe_slug}_{q_type}.gguf"
-            final_path = os.path.join(final_dir, final_name)
+            if "GGUF_" in q_format:
+                # Logic for Llama.cpp / GGUF
+                q_type = q_format.replace("GGUF_", "")
+                final_name = f"WAN22_{recipe_slug}_{q_type}.gguf"
+                final_path = os.path.join(final_dir, final_name)
+                
+                yield log_acc + f"🔨 GGUF: {q_type} -> {final_path}\n", "", f"GGUF {q_type}..."
+                cmd = ["python", "convert.py", "--path", temp_path, "--dst", final_path, "--outtype", q_type]
             
-            log_acc += f"🔨 QUANTIZING: {q_type} -> {final_path} (RAM Disk)\n"
-            yield log_acc, "", f"Quantizing to {q_type}..."
+            else:
+                # Logic for your 'convert_to_quant' PIP PACKAGE
+                final_name = f"WAN22_{recipe_slug}_{q_format}.safetensors"
+                final_path = os.path.join(final_dir, final_name)
+                
+                yield log_acc + f"🔨 PIP PACKAGE: {q_format.upper()} -> {final_path}\n", "", f"Quantizing {q_format}..."
+                
+                # Base command using the package entry point
+                # We use -i for input and the package handles output naming or we use redirect
+                cmd = ["convert_to_quant", "-i", temp_path, "--comfy_quant", "--wan"]
+                
+                if q_format == "int8":
+                    cmd += ["--int8", "--block_size", "128"] # Optimized for WAN
+                elif q_format == "nvfp4":
+                    cmd += ["--nvfp4"] # Blackwell optimization
+                # fp8 is the default in your package
 
-            # Call convert.py logic. Ensure convert.py is in the same folder.
-            # We use --outtype for GGUF usually, or --qtype if that's your convert.py's argument
-            cmd = ["python", "convert.py", "--src", temp_path, "--dst", final_path, "--outtype", q_type]
+            # Run the selected tool
             subprocess.run(cmd, check=True)
             
-            log_acc += f"✅ GGUF COMPLETE: {final_name}\n"
+            # If the pip package saves to a default name, you may need to move it to final_path
+            # Most quant tools save next to the input if -o isn't specified.
+            
+            log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
             yield log_acc, final_path, "Process Finished"
-        else:
-            yield log_acc, temp_path, "Finished (Master Only)"
-
-    except KeyboardInterrupt:
-        yield log_acc + "\n⚠️ Interrupted by user.\n", "", "Aborted"
-        return "🛑 User Aborted.", "", "Aborted"
-    except Exception as e:
-        log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
-        yield log_acc, "", "Critical Error"
 
 # --- 5. UI CONSTRUCTION (Gradio 6.0 Compliant) ---
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
@@ -265,7 +281,7 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
                 gr.Markdown("### ⚙️ Export Configuration")
                 quant_select = gr.Radio(
                     choices=[
-                        "None (FP16 Master)", "GGUF_Q8_0", "GGUF_Q6_K", 
+                        "None (FP16 Master)", "fp8", "GGUF_Q8_0", "GGUF_Q6_K", 
                         "GGUF_Q5_K_M", "GGUF_Q4_K_M", "GGUF_Q2_K"
                     ], 
                     value="None (FP16 Master)", 

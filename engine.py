@@ -16,44 +16,48 @@ class ActionMasterEngine:
             
         # Detect Noise Level correctly
         base_lower = base_path.lower()
-        self.is_motion_base = "high" in base_lower or "i2v" in base_lower
+        self.is_motion_base = "high_noise" in base_lower 
         self.role_label = "MOTION (14B High Noise)" if self.is_motion_base else "REFINER (14B Low Noise)"
+        
+        print(f"🛰️ Engine: {self.role_label} Active.")
         
         print(f"📥 Loading Base Model: {os.path.basename(base_path)}")
         self.base_dict = load_file(base_path)
         self.base_keys = list(self.base_dict.keys())
-        print(f"🛰️ Engine: {self.role_label} Active.")
 
     def validate_recipe_compatibility(self):
         print(f"🛡️ VALIDATING RECIPE: Ensuring LoRA compatibility for {self.role_label}...")
         
-        # Determine the "Forbidden" keyword based on the active model
-        forbidden = "low" if self.is_motion_base else "high"
-        required = "high" if self.is_motion_base else "low"
+        # Determine what we ARE looking for
+        # If High Model -> LoRAs must be high
+        # If Low Model -> LoRAs must be low
+        target_tag = "high" if self.is_motion_base else "low"
+        opposite_tag = "low" if self.is_motion_base else "high"
         
         issues = []
         for step in self.recipe.get('pipeline', []):
             for feature in step.get('features', []):
                 filename = feature['file'].lower()
                 
-                # Check for explicit mismatches
-                if forbidden in filename:
-                    issues.append(f"❌ MISMATCH: LoRA '{feature['file']}' contains '{forbidden}' but engine is {self.role_label}.")
+                # Check 1: Does it contain the WRONG noise level?
+                if opposite_tag in filename:
+                    issues.append(f"❌ MISMATCH: LoRA '{feature['file']}' is {opposite_tag.upper()} but engine is {self.role_label}.")
                 
-                # Check for missing expected labels (Optional Warning)
-                if required not in filename:
-                    # We don't block the merge, just notify
-                    pass 
+                # Check 2: Does it lack the CORRECT noise level? (Safety check)
+                elif target_tag not in filename:
+                    # We don't necessarily block it (might be a universal LoRA), but we log it
+                    print(f"⚠️  NOTICE: LoRA '{feature['file']}' has no explicit noise tag. Proceeding...")
 
         if issues:
+            print("\n" + "!"*40)
             print("\n".join(issues))
-            confirm = input("\n⚠️ Critical compatibility issues found. Continue anyway? (y/n): ")
-            if confirm.lower() != 'y':
-                print("🛑 Operation aborted by user.")
-                exit()
-        else:
-            print("✅ Recipe validation passed: No noise-level conflicts detected.")
-    
+            print("!"*40)
+            # Since this is a GUI-focused app, we should avoid 'input()' as it freezes the process
+            # Instead, we return the issues to app.py for the compatibility report
+            return issues 
+        
+        print("✅ Recipe validation passed: No noise-level conflicts detected.")
+        return []
     def get_compatibility_report(self):
         """Returns list of LoRAs that contain the 'forbidden' noise-level keyword."""
         forbidden = "low" if self.is_motion_base else "high"
