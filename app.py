@@ -259,17 +259,22 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
 # --- 5. UI CONSTRUCTION (Gradio 6.0 Compliant) ---
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     with gr.Row():
-        with gr.Column(scale=4): # Increased scale for title
+        with gr.Column(scale=4): 
             gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**14B High-Precision MoE Pipeline**")
         
-        with gr.Column(scale=3): # Balanced scales for status cards
+        # COLUMN 2: RESTORED VITALS
+        with gr.Column(scale=3):
             with gr.Group(elem_classes="vitals-card"):
                 vitals_box = gr.Textbox(label="System Health", value=get_sys_info(), lines=3, interactive=False)
+                # Keep the timer active so it updates every 2 seconds
                 gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
         
+        # COLUMN 3: STAGE & PROGRESS
         with gr.Column(scale=3):
             with gr.Group(elem_classes="vitals-card"):
                 pipeline_status = gr.Label(label="Current Stage", value="Idle")
+                # This anchors the progress bar here so it stays out of the terminal
+                main_progress = gr.Progress(track_tqdm=True)
 
     with gr.Row():
         with gr.Column(scale=2):
@@ -321,7 +326,8 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     start_btn.click(
         fn=run_pipeline, 
         inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], 
-        outputs=[terminal_box, last_path_state, pipeline_status]
+        outputs=[terminal_box, last_path_state, pipeline_status],
+        show_progress="hidden" # This prevents the overlay on Textboxes
     )
 
     stop_btn.click(fn=terminate_pipeline, outputs=[terminal_box])
@@ -331,13 +337,22 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
 # --- 7. LAUNCH (CSS Moved Here for Gradio 6.0) ---
 if __name__ == "__main__":
     try:
-        demo.launch(css=CSS_STYLE)
+        # The 'show_api=False' helps prevent some internal thread conflicts
+        demo.launch(css=CSS_STYLE) 
     except KeyboardInterrupt:
-        print("\n\n" + "="*60)
+        print("\n" + "!"*60)
         print("🛑 SIGNAL RECEIVED: Performing Clean Shutdown...")
-        print("   - Clearing Tensors...")
+        
+        # 1. Kill the background merge/quant process if it exists
+        if active_process:
+            print("   - Terminating active subprocess...")
+            active_process.terminate()
+            
+        # 2. Clear GPU memory to prevent driver hanging
+        print("   - Flushing VRAM...")
         torch.cuda.empty_cache()
-        print("   - Terminating Active Processes...")
-        terminate_pipeline() # Uses your existing function
-        print("✅ Shutdown Complete. Goodbye Master.")
-        print("="*60 + "\n")
+        
+        print("✅ Shutdown Complete. Terminal Safe.")
+        print("!"*60 + "\n")
+        # Exit without letting the error bubble up to the OS
+        os._exit(0)

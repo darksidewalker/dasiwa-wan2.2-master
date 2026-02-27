@@ -244,11 +244,9 @@ class ActionMasterEngine:
             })
         except KeyboardInterrupt:
             print(f"\n🛑 ENGINE INTERRUPT: Pass '{step.get('pass_name')}' halted.")
-            # We don't 'exit' here, we let the exception bubble up to app.py 
-            # after we clean up our local mess.
-            raise 
+            # DO NOT 'raise' here. Just return so the finally block clears the RAM.
+            return 
         finally:
-            # This runs NO MATTER WHAT (success or Ctrl+C)
             self._cleanup()
             torch.cuda.empty_cache()
 
