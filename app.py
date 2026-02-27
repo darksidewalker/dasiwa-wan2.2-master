@@ -213,62 +213,65 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         torch.cuda.empty_cache()
         gc.collect()
 
-        if q_format != "None (FP16 Master Only)":
+        # FIX: Matches the exact string in the Radio choices
+        if q_format != "None (FP16 Master)":
             if "GGUF_" in q_format:
-                # Logic for Llama.cpp / GGUF
                 q_type = q_format.replace("GGUF_", "")
                 final_name = f"WAN22_{recipe_slug}_{q_type}.gguf"
                 final_path = os.path.join(final_dir, final_name)
                 
                 yield log_acc + f"🔨 GGUF: {q_type} -> {final_path}\n", "", f"GGUF {q_type}..."
+                # FIX: Ensure --outtype is passed correctly
                 cmd = ["python", "convert.py", "--path", temp_path, "--dst", final_path, "--outtype", q_type]
             
             else:
-                # Logic for your 'convert_to_quant' PIP PACKAGE
                 final_name = f"WAN22_{recipe_slug}_{q_format}.safetensors"
                 final_path = os.path.join(final_dir, final_name)
                 
                 yield log_acc + f"🔨 PIP PACKAGE: {q_format.upper()} -> {final_path}\n", "", f"Quantizing {q_format}..."
                 
-                # Base command using the package entry point
-                # We use -i for input and the package handles output naming or we use redirect
+                # Use --wan flag to protect time embeddings
                 cmd = ["convert_to_quant", "-i", temp_path, "--comfy_quant", "--wan"]
                 
                 if q_format == "int8":
-                    cmd += ["--int8", "--block_size", "128"] # Optimized for WAN
+                    cmd += ["--int8", "--block_size", "128"]
                 elif q_format == "nvfp4":
-                    cmd += ["--nvfp4"] # Blackwell optimization
-                # fp8 is the default in your package
+                    cmd += ["--nvfp4"]
+                # fp8 is default for convert_to_quant
 
-            # Run the selected tool
             subprocess.run(cmd, check=True)
-            
-            # If the pip package saves to a default name, you may need to move it to final_path
-            # Most quant tools save next to the input if -o isn't specified.
-            
             log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
             yield log_acc, final_path, "Process Finished"
+        else:
+            # FIX: Properly handle the path for "None" selection
+            yield log_acc + "✅ MASTER FP16 READY ON SSD.\n", temp_path, "Finished"
+
+    except KeyboardInterrupt:
+        yield log_acc + "\n⚠️ Interrupted by user.\n", "", "Aborted"
+    except Exception as e:
+        log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
+        yield log_acc, "", "Critical Error"
+    finally:
+        # Ensure we always reset the active process global
+        global active_process
+        active_process = None
 
 # --- 5. UI CONSTRUCTION (Gradio 6.0 Compliant) ---
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     with gr.Row():
-        with gr.Column(scale=3):
+        with gr.Column(scale=4): # Increased scale for title
             gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**14B High-Precision MoE Pipeline**")
         
-        # Centralized Health & Status
-        with gr.Column(scale=2):
+        with gr.Column(scale=3): # Balanced scales for status cards
             with gr.Group(elem_classes="vitals-card"):
                 vitals_box = gr.Textbox(label="System Health", value=get_sys_info(), lines=3, interactive=False)
                 gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
         
-        with gr.Column(scale=2):
+        with gr.Column(scale=3):
             with gr.Group(elem_classes="vitals-card"):
                 pipeline_status = gr.Label(label="Current Stage", value="Idle")
-                # The progress bar component is usually internal to gr.Progress, 
-                # but we use this Label as a persistent visual anchor.
 
     with gr.Row():
-        # LEFT: Control Panel
         with gr.Column(scale=2):
             with gr.Group():
                 gr.Markdown("### 📂 Assets")
@@ -280,9 +283,10 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
             with gr.Group():
                 gr.Markdown("### ⚙️ Export Configuration")
                 quant_select = gr.Radio(
+                    # FIX: Simplified string to match pipeline logic exactly
                     choices=[
-                        "None (FP16 Master)", "fp8", "GGUF_Q8_0", "GGUF_Q6_K", 
-                        "GGUF_Q5_K_M", "GGUF_Q4_K_M", "GGUF_Q2_K"
+                        "None (FP16 Master)", "fp8", "nvfp4", "int8", 
+                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q4_K_M"
                     ], 
                     value="None (FP16 Master)", 
                     label="Target Format"
