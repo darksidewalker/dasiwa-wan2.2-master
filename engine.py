@@ -104,64 +104,89 @@ class ActionMasterEngine:
             return (delta * final_mult).to("cpu"), passed_pct, limit_hit
 
     def process_pass(self, step, global_mult):
-        features = step.get('features', [])
-        lora_dir = self.paths.get('lora_dir', 'loras')
-        req_density = float(step.get('density', 0.9))
-        method = str(step.get('method', 'addition')).lower().strip()
-        use_smart = (method == "injection")
-        
-        pre_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
-        pass_stats = {"matrix": 0, "vector": 0, "dense": 0}
-        total_inj, pass_peaks = [], 0
-        
-        for f in features:
-            lora_path = os.path.join(lora_dir, f['file'])
-            if not os.path.exists(lora_path): continue
-
-            lora_sd = load_file(lora_path)
-            avg_mag = self.scan_lora_density(lora_sd)
-            asked_weight = float(f.get('weight', 1.0))
+            features = step.get('features', [])
+            lora_dir = self.paths.get('lora_dir', 'loras')
+            method = str(step.get('method', 'addition')).lower().strip()
+            use_smart = (method == "injection")
             
-            print(f"🔍 SCAN [{f['file']}]")
-            print(f"   ├─ Raw Signal: {avg_mag:.4f}")
-            print(f"   ├─ Multiplier: x{asked_weight:.2f} (Target: {avg_mag * asked_weight:.4f})")
-            print(f"   └─ Mode: {'INJECTION' if use_smart else 'ADDITION'}")
+            pre_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
+            pass_stats = {"matrix": 0, "vector": 0, "dense": 0, "skipped": 0}
+            total_inj, pass_peaks = [], 0
+            
+            for f in features:
+                lora_path = os.path.join(lora_dir, f['file'])
+                if not os.path.exists(lora_path): continue
 
-            for target_key in self.base_keys:
-                k1, k2, k_type = self.find_lora_keys(lora_sd, target_key)
-                dk = target_key if target_key in lora_sd else (f"diffusion_model.{target_key}" if f"diffusion_model.{target_key}" in lora_sd else None)
+                lora_sd = load_file(lora_path)
+                avg_mag = self.scan_lora_density(lora_sd)
+                asked_weight = float(f.get('weight', 1.0))
                 
-                with torch.no_grad():
-                    delta, inj_val, hit = None, 100.0, False
-                    if k_type == "matrix":
-                        delta, inj_val, hit = self.calculate_delta(lora_sd, k1, k2, f['weight'], global_mult, target_key, smart_logic=use_smart)
-                    elif k_type == "vector":
-                        delta = (lora_sd[k1].to(torch.float32) * float(f['weight']) * global_mult).cpu()
-                    elif dk:
-                        k_type = "dense"
-                        raw_delta = lora_sd[dk].to(torch.float32) * float(f['weight']) * global_mult
-                        delta = raw_delta.cpu() # Simplified Dense for brevity
-                    
-                    if hit: pass_peaks += 1
-                    if delta is not None and self.apply_delta(target_key, delta):
-                        pass_stats[k_type] += 1
-                        if k_type in ["matrix", "dense"]: total_inj.append(inj_val)
-            
-            if pass_peaks > 0 and use_smart:
-                print(f"   ⚠️ PEAK ALERT: Limiter squashed {pass_peaks} layers. (Too hot!)")
-            self._cleanup()
+                # Visibility: Track which LoRA keys were successfully used
+                lora_keys_in_file = [k for k in lora_sd.keys() if "weight" in k]
+                used_lora_keys = set()
 
-        post_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
-        avg_injection = sum(total_inj) / len(total_inj) if total_inj else 100.0
-        
-        self.summary_data.append({
-            "pass": step.get('pass_name', 'Pass'),
-            "method": method.upper(),
-            "layers": sum(pass_stats.values()),
-            "inj": avg_injection,
-            "peaks": pass_peaks,
-            "delta": abs(post_mean - pre_mean)
-        })
+                print(f"🔍 SCAN [{f['file']}]")
+                print(f"   ├─ Raw Signal: {avg_mag:.4f}")
+                print(f"   ├─ Multiplier: x{asked_weight:.2f} (Target: {avg_mag * asked_weight:.4f})")
+                print(f"   └─ Mode: {'INJECTION' if use_smart else 'ADDITION'}")
+
+                for target_key in self.base_keys:
+                    # Use our new strict Architecture-Aware key finder
+                    k1, k2, k_type = self.find_lora_keys(lora_sd, target_key)
+                    
+                    # Manual fallback for dense (full-weight) merges if exists
+                    dk = None
+                    if not k1:
+                        dk = target_key if target_key in lora_sd else (f"diffusion_model.{target_key}" if f"diffusion_model.{target_key}" in lora_sd else None)
+
+                    with torch.no_grad():
+                        delta, inj_val, hit = None, 100.0, False
+                        
+                        if k_type == "matrix":
+                            used_lora_keys.add(k1)
+                            if k2: used_lora_keys.add(k2)
+                            delta, inj_val, hit = self.calculate_delta(lora_sd, k1, k2, f['weight'], global_mult, target_key, smart_logic=use_smart)
+                        
+                        elif k_type == "vector":
+                            used_lora_keys.add(k1)
+                            delta = (lora_sd[k1].to(torch.float32) * float(f['weight']) * global_mult).cpu()
+                        
+                        elif dk:
+                            k_type = "dense"
+                            used_lora_keys.add(dk)
+                            delta = (lora_sd[dk].to(torch.float32) * float(f['weight']) * global_mult).cpu()
+                        
+                        if hit: pass_peaks += 1
+                        
+                        # Apply the delta using the CPU-handshake method
+                        if delta is not None:
+                            if self.apply_delta(target_key, delta):
+                                pass_stats[k_type] += 1
+                                if k_type in ["matrix", "dense"]: total_inj.append(inj_val)
+                            else:
+                                pass_stats["skipped"] += 1
+
+                # Check for orphaned keys (LoRA weights that found no home in the base model)
+                orphans = len([k for k in lora_keys_in_file if k not in used_lora_keys])
+                if orphans > 0:
+                    print(f"   ℹ️  INFO: {orphans} keys in LoRA had no matching layers in Base (Structural Mismatch).")
+                    pass_stats["skipped"] += orphans
+                
+                if pass_peaks > 0 and use_smart:
+                    print(f"   ⚠️ PEAK ALERT: Limiter squashed {pass_peaks} layers. (Too hot!)")
+                self._cleanup()
+
+            post_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
+            avg_injection = sum(total_inj) / len(total_inj) if total_inj else 100.0
+            
+            self.summary_data.append({
+                "pass": step.get('pass_name', 'Pass'),
+                "method": method.upper(),
+                "layers": sum(v for k,v in pass_stats.items() if k != "skipped"),
+                "inj": avg_injection,
+                "peaks": pass_peaks,
+                "delta": abs(post_mean - pre_mean)
+            })
 
     def apply_delta(self, target_key, delta):
         base = self.base_dict[target_key]
