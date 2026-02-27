@@ -155,6 +155,7 @@ class ActionMasterEngine:
             return (delta * final_mult).to("cpu"), passed_pct, limit_hit
 
     def process_pass(self, step, global_mult):
+        try:
             features = step.get('features', [])
             lora_dir = self.paths.get('lora_dir', 'loras')
             method = str(step.get('method', 'addition')).lower().strip()
@@ -238,6 +239,15 @@ class ActionMasterEngine:
                 "peaks": pass_peaks,
                 "delta": abs(post_mean - pre_mean)
             })
+        except KeyboardInterrupt:
+            print(f"\n🛑 ENGINE INTERRUPT: Pass '{step.get('pass_name')}' halted.")
+            # We don't 'exit' here, we let the exception bubble up to app.py 
+            # after we clean up our local mess.
+            raise 
+        finally:
+            # This runs NO MATTER WHAT (success or Ctrl+C)
+            self._cleanup()
+            torch.cuda.empty_cache()
 
     def apply_delta(self, target_key, delta):
         base = self.base_dict[target_key]
