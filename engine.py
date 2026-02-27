@@ -28,51 +28,76 @@ class ActionMasterEngine:
         return avg_mag
 
     def find_lora_keys(self, lora_sd, target_key):
-        base_slug = target_key.replace("diffusion_model.", "").replace(".weight", "").replace(".", "").replace("_", "")
+        # Standardize the target path (e.g., 'blocks.0.cross_attn.k')
+        # This acts as our "anchor" that must exist in the LoRA key
+        clean_target = target_key.replace("diffusion_model.", "").replace(".weight", "")
+        
+        # Map of Up/Down pairs for your 3 specific examples
+        pairs = [
+            (".lora_B", ".lora_A"),       # Example 1 & 2
+            (".lora_up", ".lora_down"),   # Example 3
+        ]
+
         for k in lora_sd.keys():
-            lora_slug = k.replace("diffusion_model.", "").replace(".weight", "").replace(".", "").replace("_", "")
-            if base_slug in lora_slug:
-                if "loraup" in lora_slug or "loraB" in lora_slug:
-                    up = k
-                    down = up.replace("lora_up", "lora_down").replace("lora_B", "lora_A")
-                    if down in lora_sd: return up, down, "matrix"
-                if "diff" in lora_slug or "alpha" in lora_slug:
+            # Check if the anchor path is present and strictly bounded by dots
+            # This prevents 'blocks.1' from matching 'blocks.11'
+            if f"{clean_target}." in k or k.startswith(f"{clean_target}."):
+                for up_suf, down_suf in pairs:
+                    if up_suf in k:
+                        up_k = k
+                        down_k = k.replace(up_suf, down_suf)
+                        if down_k in lora_sd:
+                            return up_k, down_k, "matrix"
+                
+                # Fallback for vectors/alphas
+                if any(x in k for x in [".diff", ".alpha"]):
                     return k, None, "vector"
+                    
         return None, None, None
 
     def calculate_delta(self, lora_sd, up_k, down_k, weight, global_mult, target_key, smart_logic=True):
         with torch.no_grad():
             up_w = lora_sd[up_k].to(DEVICE, dtype=torch.float32)
             down_w = lora_sd[down_k].to(DEVICE, dtype=torch.float32)
-            if up_w.shape[1] == down_w.shape[1]: down_w = down_w.t()
-            elif up_w.shape[0] == down_w.shape[0]: up_w = up_w.t()
             
-            try: delta = torch.matmul(up_w, down_w)
-            except: return None, 0.0, False
+            # 1. Automatic Dimension Correction
+            if up_w.shape[1] != down_w.shape[0]:
+                if up_w.shape[1] == down_w.shape[1]: down_w = down_w.t()
+                elif up_w.shape[0] == down_w.shape[0]: up_w = up_w.t()
+            
+            # 2. Rank and Alpha Scaling (Crucial for Style Preservation)
+            rank = up_w.shape[1]
+            # Look for alpha using the base name of the Up key
+            alpha_key = up_k.split('.lora')[0] + ".alpha"
+            alpha_val = lora_sd.get(alpha_key, torch.tensor(float(rank)))
+            scale = alpha_val.item() / rank if rank != 0 else 1.0
+            
+            delta = torch.matmul(up_w, down_w) * scale
 
+            # 3. Apply your Specific Merging Methods
             passed_pct, limit_hit = 100.0, False
-            if smart_logic:
+            
+            if smart_logic:  # This is your "Injection" method
                 base_w = self.base_dict[target_key].to(DEVICE, dtype=torch.float32)
-                is_new = torch.var(delta).item() > (torch.var(base_w).item() * 1.5)
+                # Thresholding based on base weight variance
+                base_var = torch.var(base_w).item()
+                is_new_info = torch.var(delta).item() > (base_var * 1.5)
                 
-                sensitivity = 0.4 if is_new else 1.8 
-                gate_threshold = delta.abs().mean() * sensitivity
-                mask = delta.abs() > gate_threshold
+                # Sensitivity gate
+                sensitivity = 0.4 if is_new_info else 1.8 
+                gate = delta.abs().mean() * sensitivity
+                mask = delta.abs() > gate
                 delta = torch.where(mask, delta, torch.zeros_like(delta))
                 passed_pct = (mask.sum().item() / mask.numel()) * 100
 
+                # Peak Limiter to prevent "Deep Fried" pixels
                 max_val = delta.abs().max()
-                limit = 0.08 if is_new else 0.05
+                limit = 0.08 if is_new_info else 0.05
                 if max_val > limit:
                     delta *= (limit / max_val)
                     limit_hit = True
 
-            rank = up_w.shape[1]
-            a_key = up_k.replace("lora_B", "alpha").replace("lora_up", "alpha")
-            a_val = lora_sd.get(a_key, torch.tensor(float(rank)))
-            a = a_val.float().flatten()[0].item() if a_val.numel() > 0 else float(rank)
-            
-            final_mult = (a / rank if rank != 0 else 1.0) * float(weight) * global_mult
+            final_mult = float(weight) * global_mult
             return (delta * final_mult).to("cpu"), passed_pct, limit_hit
 
     def process_pass(self, step, global_mult):
