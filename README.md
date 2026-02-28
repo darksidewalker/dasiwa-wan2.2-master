@@ -1,4 +1,4 @@
-# 🌀 DaSiWa WAN 2.2 Master: Merger & Quantizer
+# 🌀 DaSiWa WAN 2.2 Master: Merger & Quantizer (WIP)
 
 DaSiWa WAN 2.2 Master is a high-performance industrial toolkit designed for merging and quantizing Wan 2.2 (14B) Video Models. Specifically engineered for systems with 64GB RAM and NVIDIA Ada (40-series) or Blackwell (50-series) GPUs, it leverages a 55GB RAMDisk to eliminate SSD bottlenecking and maximize tensor throughput.
 
