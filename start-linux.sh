@@ -6,21 +6,10 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PATH="$PROJECT_DIR/.venv"
 LLAMA_DIR="$PROJECT_DIR/llama.cpp"
 PATCH_FILE="$PROJECT_DIR/lcpp.patch"
-RAMDISK_PATH="/mnt/ramdisk"
-RAMDISK_SIZE="55G"
 
 echo "📂 Project Root: $PROJECT_DIR"
 
-# --- 2. RAMDISK SETUP ---
-if mountpoint -q "$RAMDISK_PATH"; then
-    echo "✅ RAMDisk already mounted at $RAMDISK_PATH"
-else
-    echo "⚙️ Mounting $RAMDISK_SIZE RAMDisk..."
-    sudo mkdir -p "$RAMDISK_PATH"
-    sudo mount -t tmpfs -o size=$RAMDISK_SIZE,mode=1777 tmpfs "$RAMDISK_PATH"
-fi
-
-# --- 3 & 4. CLONE, PATCH & BUILD LLAMA.CPP (SKIP IF DONE) ---
+# --- 2. CLONE, PATCH & BUILD LLAMA.CPP (SKIP IF DONE) ---
 cd "$PROJECT_DIR"
 
 # Define the path to the final binary we need
@@ -50,7 +39,7 @@ else
         git apply "$PROJECT_DIR/lcpp.patch"
     fi
 
-    # 3. Build with your modern CUDA + C++17 flags
+    # 3. Build with modern CUDA + C++17 flags
     mkdir -p build && cd build
     cmake .. -DGGML_CUDA=ON \
              -DCMAKE_CUDA_ARCHITECTURES=native \
@@ -62,28 +51,25 @@ else
     cd "$PROJECT_DIR"
 fi
 
-# --- 5. LOCAL VENV SETUP ---
+# --- 3. LOCAL VENV SETUP ---
 if [ ! -d "$VENV_PATH" ]; then
     echo "⚙️ Creating local virtual environment..."
     uv venv "$VENV_PATH"
 fi
 
 echo "📦 Syncing Python dependencies..."
-# Use 'uv pip' which automatically detects the local .venv
-# as long as we are in the project directory.
 uv pip install --refresh -r requirements.txt
 
 echo "💎 Installing FP Quantization Tools..."
-# Install silveroxides' quantizer
 uv pip install --refresh git+https://github.com/silveroxides/convert_to_quant.git@main#egg=convert_to_quant --no-deps --force-reinstall
 
 echo "🍳 Installing Comfy Kitchen [CUBLAS]..."
-# Install comfy-kitchen with cublas support for NVFP4 (+Blackwell)
 uv pip install --refresh "comfy-kitchen[cublas]"
 
-# --- 6. LAUNCH ---
+# --- 4. LAUNCH ---
 echo "🚀 Starting DaSiWa WAN 2.2 Master ..."
 export VIRTUAL_ENV="$VENV_PATH"
 export PATH="$VENV_PATH/bin:$PATH"
 
+# Ensure Python knows we aren't using RAMDisk anymore
 python app.py
