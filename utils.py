@@ -60,28 +60,32 @@ def sync_ram_to_ssd(path):
     return f"✅ MOVED: {os.path.basename(dest)}"
 
 def get_final_summary_string(summary_data, role_label):
-    lines = ["\n" + "="*85, f"📊 FINAL MERGE SUMMARY: {role_label}", "="*85]
-    lines.append(f"{'PASS NAME':<15} | {'METHOD':<10} | {'LAYERS':<8} | {'METRIC %':<12} | {'PEAKS':<6} | {'SHIFT'}")
-    lines.append("-" * 85)
+    # Header Construction
+    lines = ["\n" + "="*105, f"📊 14B MODEL MERGE SUMMARY: {role_label}", "="*105]
+    # Added 'RANK TIER' for better tracking of the Smart Gate decisions
+    lines.append(f"{'PASS NAME':<18} | {'METHOD':<10} | {'RANK TIER':<15} | {'KEPT %':<8} | {'PEAKS':<8} | {'SHIFT'}")
+    lines.append("-" * 105)
     
     total_delta = 0
     for s in summary_data:
-        # Pulls dynamic 'method' and 'pass' set during process_pass
-        lines.append(f"{s['pass']:<15} | {s['method']:<10} | {s['layers']:<8} | {s['inj']:>10.1f}% | {s['peaks']:<6} | {s['delta']:.8f}")
+        # Pulling the new 'tier' key we added to the dictionary
+        tier_label = s.get('tier', 'N/A')
+        kept_val = s.get('kept', 0.0)
+        
+        lines.append(f"{s['pass']:<18} | {s['method']:<10} | {tier_label:<15} | {kept_val:>7.1f}% | {s['peaks']:<8} | {s['delta']:.8f}")
         total_delta += s['delta']
     
-    lines.append("-" * 85)
+    lines.append("-" * 105)
 
-    # Stability logic using match-case
+    # RECALIBRATED STABILITY FOR WAN 2.2 14B
+    # These thresholds ensure the Mixture of Experts (MoE) doesn't collapse
     match total_delta:
-        case d if d < 0.015:
-            status, icon = "STABLE", "✅"
-        case d if d < 0.030:
-            status, icon = "SATURATED", "⚠️"
-        case _:
-            status, icon = "VOLATILE", "🔥"
+        case d if d < 0.002: status, icon = "STABLE (EXCELLENT)", "✅"
+        case d if d < 0.008: status, icon = "SATURATED (HEAVY)", "⚠️"
+        case d if d < 0.015: status, icon = "VOLATILE (SENSITIVE)", "🔥"
+        case _:              status, icon = "CRITICAL (EXPLODED)", "💀"
 
-    lines.append(f"{'TOTAL MODEL SHIFT':<52} | {total_delta:.8f}")
-    lines.append(f"{'STABILITY CHECK':<52} | {icon} {status}")
-    lines.append("="*85 + "\n")
+    lines.append(f"{'TOTAL CUMULATIVE MODEL SHIFT':<76} | {total_delta:.8f}")
+    lines.append(f"{'STABILITY CHECK (14B CALIBRATION)':<76} | {icon} {status}")
+    lines.append("="*105 + "\n")
     return "\n".join(lines)

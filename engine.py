@@ -49,73 +49,75 @@ class ActionMasterEngine:
                     if any(x in k for x in [".diff", ".alpha", ".bias", "_alpha", "_bias"]): return k, None, "vector"
         return None, None, None
 
-    def calculate_delta(self, lora_sd, up_k, down_k, weight, global_mult, target_key, smart_logic=True):
+    def calculate_delta(self, lora_sd, up_k, down_k, weight, global_mult, target_key, lora_path, smart_logic=True):
         # 1. TRIGGER LOW-RAM SAFEGUARD
-        # Check real-time system overhead from config.py
         is_low_ram = get_ram_threshold_met() 
         
         with torch.no_grad():
-            # Dynamically select device based on memory pressure
             calc_device = DEVICE if not is_low_ram else "cpu"
             
-            # Load tensors to the designated calculation device
             up_w = lora_sd[up_k].to(calc_device, dtype=torch.float32)
             down_w = lora_sd[down_k].to(calc_device, dtype=torch.float32)
 
-            # Shape Correction match-case
-            match (up_w.shape, down_w.shape):
-                case ((u_r, u_c), (d_r, d_c)) if u_c != d_r:
-                    if u_c == d_c: down_w = down_w.t()
-                    elif u_r == d_r: up_w = up_w.t()
+            # Shape Correction
+            if up_w.shape[1] != down_w.shape[0]:
+                if up_w.shape[1] == down_w.shape[1]: down_w = down_w.t()
+                elif up_w.shape[0] == down_w.shape[0]: up_w = up_w.t()
             
             rank = up_w.shape[1]
             alpha_key = up_k.split('.lora')[0] + ".alpha"
             alpha_val = lora_sd.get(alpha_key, torch.tensor(float(rank)))
             scale = alpha_val.item() / rank if rank != 0 else 1.0
             
-            # Perform matrix multiplication
             delta = torch.matmul(up_w, down_w) * scale
             
-            # 2. IMMEDIATE OFFLOAD IF RAM IS CRITICAL
-            # Prevent VRAM/RAM accumulation during 14B processing
             if is_low_ram:
-                up_w = up_w.to("cpu")
-                down_w = down_w.to("cpu")
+                up_w, down_w = up_w.to("cpu"), down_w.to("cpu")
 
             passed_pct, limit_hit = 100.0, False
 
             if smart_logic:
-                # Move base weights to calculation device temporarily
+                # --- DYNAMIC MASS CALIBRATION (NEW) ---
+                # Calculate size in MB to determine Rank-based aggression
+                lora_size_mb = os.path.getsize(lora_path) / (1024 * 1024)
+                
+                if lora_size_mb < 350:      # RANK 32: Surgical / Small
+                    g_base, l_base = 0.005, 0.20
+                elif lora_size_mb < 750:    # RANK 64: Balanced
+                    g_base, l_base = 0.015, 0.12
+                elif lora_size_mb < 1100:   # RANK 128: Heavy
+                    g_base, l_base = 0.040, 0.09
+                else:                       # RANK 256+: Structural
+                    g_base, l_base = 0.120, 0.06
+
+                # --- DISPATCH LOGIC ---
                 base_w = self.base_dict[target_key].to(calc_device, dtype=torch.float32)
                 base_var = torch.var(base_w).item()
                 is_new_info = torch.var(delta).item() > (base_var * 1.5)
                 
-                # Threshold dispatch for WAN 2.2
                 match is_new_info:
-                    case True: # MOTION / HIGH IMPACT
-                        gate_mult, limit = 0.4, 0.08
-                    case False: # REFINER / SUBTLE IMPACT
-                        gate_mult, limit = 1.8, 0.05
+                    case True: # NSFW / MOTION / IMPACT
+                        gate_mult, limit = g_base, l_base
+                    case False: # REFINER / STYLE
+                        gate_mult, limit = g_base * 8, l_base * 0.5
                 
+                # Apply Gating
                 gate = delta.abs().mean() * gate_mult
                 mask = delta.abs() > gate
                 delta = torch.where(mask, delta, torch.zeros_like(delta))
                 passed_pct = (mask.sum().item() / mask.numel()) * 100
                 
-                # Apply safety limits to prevent "deep-fried" artifacts
+                # Apply Safety Limit (Prevent "Deep-Frying")
                 if delta.abs().max() > limit:
                     delta *= (limit / delta.abs().max())
                     limit_hit = True
                 
-                # Cleanup base weight from VRAM immediately
-                if calc_device != "cpu":
-                    del base_w
+                if calc_device != "cpu": del base_w
 
-            # Final result is always offloaded to CPU for the master dictionary
+            # Final result return
             return (delta * float(weight) * global_mult).to("cpu"), passed_pct, limit_hit
 
     def process_pass(self, step, global_mult):
-        # 1. Pull dynamic labels directly from your JSON fields
         method_label = str(step.get('method', 'ADDITION')).upper()
         pass_name = str(step.get('pass_name', 'Pass')).upper()
         
@@ -127,8 +129,6 @@ class ActionMasterEngine:
         pass_stats, total_inj, pass_peaks = {"matrix": 0, "vector": 0, "dense": 0, "skipped": 0}, [], 0
         
         for f in features:
-            # --- LOW-RAM SAFEGUARD CHECK ---
-            # Triggers a warning if system RAM usage exceeds the 85% threshold
             if get_ram_threshold_met():
                 yield f"  ⚠️ SYSTEM OVERHEAD CRITICAL: Entering Low-RAM Mode for {f['file']}..." 
             
@@ -141,13 +141,16 @@ class ActionMasterEngine:
             lora_sd = load_file(lora_path)
             
             for target_key in self.base_keys:
+                # find_lora_keys logic remains the same
                 k1, k2, k_type = self.find_lora_keys(lora_sd, target_key)
                 dk = target_key if target_key in lora_sd else None
                 
                 match (k_type, dk):
                     case ("matrix", _):
-                        # calculate_delta now internally handles calc_device switching
-                        delta, inj_val, hit = self.calculate_delta(lora_sd, k1, k2, f['weight'], global_mult, target_key, use_smart)
+                        # UPDATED: Now passing lora_path for the Smart Gate logic
+                        delta, inj_val, hit = self.calculate_delta(
+                            lora_sd, k1, k2, f['weight'], global_mult, target_key, lora_path, use_smart
+                        )
                         if hit: pass_peaks += 1
                         if self.apply_delta(target_key, delta):
                             pass_stats["matrix"] += 1
@@ -163,54 +166,40 @@ class ActionMasterEngine:
                         if self.apply_delta(target_key, delta):
                             pass_stats["dense"] += 1
                             total_inj.append(100.0)
-                    case _:
-                        pass
 
-            # Explicitly clear LoRA tensors from memory before next file
             del lora_sd
             self._cleanup()
 
-            # Calculate current impact/injection value
             current_val = (sum(total_inj) / len(total_inj)) if total_inj else 100.0
             
-            # 2. Match the sub-label to the Method Type
-            match method_label:
-                case "INJECTION":
-                    metric_name = "Knowledge Kept"
-                case "ADDITION":
-                    metric_name = "Impact"
-                case _:
-                    metric_name = "Weight Shift"
+            # Health Logic: For 14B, we want high Knowledge but low Peak Shift
+            # A 'Volatile' tag here now correctly flags high variance in small LoRAs
+            health_status = "OK" if current_val > 60 else "THIN"
+            if pass_peaks > 5000: health_status = "VOLATILE" 
 
-            yield f"    └─ [{method_label}] {metric_name}: {current_val:.1f}% | Health: {'OK' if current_val > 85 else 'VOLATILE'}"
+            yield f"    └─ [{method_label}] Knowledge Kept: {current_val:.1f}% | Health: {health_status}"
 
         # Final pass summary calculation
         post_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
         shift = abs(post_mean - pre_mean)
         
+        lora_size_mb = os.path.getsize(lora_path) / (1024 * 1024)
+        if lora_size_mb < 350: tier = "R32"
+        elif lora_size_mb < 750: tier = "R64"
+        elif lora_size_mb < 1100: tier = "R128"
+        else: tier = "R256+"
+
         self.summary_data.append({
             "pass": pass_name, 
             "method": method_label, 
+            "tier": tier, 
             "layers": sum(v for k,v in pass_stats.items() if k != "skipped"), 
-            "inj": (sum(total_inj)/len(total_inj) if total_inj else 100.0), 
+            "kept": current_val, # MUST BE 'kept'
             "peaks": pass_peaks, 
             "delta": shift
         })
         
         yield f"  ✅ {pass_name} Complete. Global Shift: {shift:.8f}"
-
-        # Final pass summary
-        post_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
-        shift = abs(post_mean - pre_mean)
-        
-        self.summary_data.append({
-            "pass": pass_name, 
-            "method": method_label, 
-            "layers": sum(v for k,v in pass_stats.items() if k != "skipped"), 
-            "inj": (sum(total_inj)/len(total_inj) if total_inj else 100.0), 
-            "peaks": pass_peaks, 
-            "delta": shift
-        })
 
     def apply_delta(self, target_key, delta):
         base = self.base_dict[target_key]
@@ -240,11 +229,17 @@ class ActionMasterEngine:
         return "\n".join(lines)
 
     def get_metadata_string(self, quant="None"):
+        # Import the correct formatter from utils
+        from utils import get_final_summary_string
+        
+        # Use the logic that already works for the UI
+        summary_text = get_final_summary_string(self.summary_data, self.role_label)
+        
         header = f"Title: {self.paths.get('title', 'Dasiwa Master')}\nExport: {quant}\n"
-        return f"{header}\n{self.get_final_summary_string()}\n🚀 Made with DaSiWa"
+        return f"{header}\n{summary_text}\n🚀 Made with DaSiWa"
 
     def save_master(self, path):
-        # Generate metadata strings before clearing memory
+        # Generate metadata strings using the fixed helper above
         metadata_str = self.get_metadata_string()
         custom_metadata = {
             "comment": metadata_str, 
