@@ -268,27 +268,36 @@ class ActionMasterEngine:
         return f"{header}\n{summary_text}\n🚀 Made with DaSiWa"
 
     def save_master(self, path):
-        # Generate metadata strings using the fixed helper above
+        """Memory-optimized save to prevent system lock during 14B writes."""
         metadata_str = self.get_metadata_string()
         custom_metadata = {
             "comment": metadata_str, 
             "dasiwa_summary": metadata_str
         }
         
+        # 1. PRE-SAVE PURGE: Clear every possible byte of VRAM/RAM
+        self._cleanup() 
+        
         try:
-            # Memory-safe check: Only make contiguous if necessary
-            for k in self.base_keys:
-                if not self.base_dict[k].is_contiguous():
-                    self.base_dict[k] = self.base_dict[k].contiguous()
-            
-            # Save directly from the original dictionary
+            # 2. CONTIGUOUS CHECK: Process one tensor at a time to avoid mass spikes
+            with torch.no_grad():
+                for k in self.base_keys:
+                    if not self.base_dict[k].is_contiguous():
+                        # Use .to() to move and clean in one step if needed
+                        self.base_dict[k] = self.base_dict[k].contiguous()
+
+            # 3. DIRECT SAVE: Write to SSD
+            print(f"💾 SSD WRITE STARTING: {os.path.basename(path)}")
             save_file(self.base_dict, path, metadata=custom_metadata)
+            return path
             
+        except Exception as e:
+            print(f"❌ SSD WRITE CRASHED: {str(e)}")
+            raise e
         finally:
-            # Force immediate memory release
+            # 4. IMMEDIATE RELEASE: Destroy the 26GB dictionary
             self.base_dict = None 
             self._cleanup()
-        return path
 
     def _cleanup(self):
         gc.collect()

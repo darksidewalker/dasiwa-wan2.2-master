@@ -100,24 +100,22 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                     yield log_acc, "", "Warning: Empty Pass"
 
             # 3. SAVE MASTER (SSD)
-            progress(0.8, desc="Exporting to SSD...")
+            progress(0.8, desc="Finalizing Tensors...")
             summary_table = get_final_summary_string(engine.summary_data, engine.role_label)
             log_acc += summary_table + "\n"
 
-            log_acc += f"💾 EXPORT: Writing Master to SSD: {temp_path}...\n"
-            yield log_acc, "", "Exporting to SSD..."
-            engine.save_master(temp_path) 
-            
-            del engine
+            # NEW: Clear memory before the heavy save call
             torch.cuda.empty_cache()
             gc.collect()
-            
-            log_acc += f"✅ MASTER SAVED: {os.path.getsize(temp_path)/1e9:.1f} GB\n"
-            yield log_acc, "", "Export Complete"
 
-        # 4. QUANTIZATION / EXPORT (MATCH-CASE)
-        torch.cuda.empty_cache()
-        gc.collect()
+            log_acc += f"💾 EXPORT: Writing Master to SSD: {temp_path}...\n"
+            yield log_acc, "", "💾 WRITING TO SSD (DO NOT CLOSE)" # Feedback added
+            
+            engine.save_master(temp_path) 
+            
+            # Wipe the engine object immediately
+            del engine
+            gc.collect()
 
         match q_format:
             case "None (FP16 Master)":
