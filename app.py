@@ -22,13 +22,11 @@ def load_recipe_text(name):
     except: return "❌ Error loading recipe."
 
 def stop_pipeline():
-    """Emergency Brake: Kills subprocess and flushes VRAM."""
     global active_process
     if active_process:
         print("🛑 STOP SIGNAL: Terminating subprocess...")
         active_process.terminate()
         active_process = None
-    
     torch.cuda.empty_cache()
     gc.collect()
     return "🛑 PROCESS TERMINATED BY USER\n" + "-"*60, "Idle"
@@ -58,7 +56,6 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             progress(0.05, desc="Initializing Engine...")
             clean_json = re.sub(r'//.*', '', recipe_json)
             recipe_dict = json.loads(clean_json)
-            
             recipe_dict['paths'] = recipe_dict.get('paths', {})
             recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
             recipe_dict['paths']['title'] = recipe_dict['paths'].get('title', recipe_slug)
@@ -76,83 +73,106 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             log_acc += f"{'='*60}\n\n"
             yield log_acc, "", "Merging Layers..."
 
-            # 2. MERGING LOOP
+            # 2. MERGING LOOP (CLEAN & INTERRUPTIBLE)
             pipeline = recipe_dict.get('pipeline', [])
             global_mult = recipe_dict['paths'].get('global_weight_factor', 1.0)
 
             for i, step in enumerate(pipeline):
                 p_name = step.get('pass_name', f"Pass {i+1}")
                 progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
-                log_acc += f"▶️ {p_name.upper()} | Mode: {step.get('method', 'ADDITION').upper()}\n"
-                yield log_acc, "", f"Merging: {p_name}"
                 
-                engine.process_pass(step, global_mult)
-                last_pass = engine.summary_data[-1]
-                peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
-                log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}{peak_str}\n"
-                yield log_acc, "", f"Merging: {p_name}"
+                # RUN THE ENGINE ONCE
+                # This loop handles all the real-time "Analyzing..." messages
+                for message in engine.process_pass(step, global_mult):
+                    log_acc += message + "\n"
+                    yield log_acc, "", f"Working: {p_name}"
+                
+                # ACCESS SUMMARY ONLY AFTER THE ENGINE FINISHES THE PASS
+                if engine.summary_data:
+                    last_pass = engine.summary_data[-1]
+                    peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
+                    
+                    log_acc += "-"*60 + "\n"
+                    
+                    yield log_acc, "", f"Finished: {p_name}"
+                else:
+                    log_acc += f"⚠️ {p_name} produced no summary data. Check LoRA files.\n"
+                    yield log_acc, "", "Warning: Empty Pass"
 
             # 3. SAVE MASTER (SSD)
             progress(0.8, desc="Exporting to SSD...")
-            log_acc += get_final_summary_string(engine.summary_data, engine.role_label) + "\n"
+            summary_table = get_final_summary_string(engine.summary_data, engine.role_label)
+            log_acc += summary_table + "\n"
+
             log_acc += f"💾 EXPORT: Writing Master to SSD: {temp_path}...\n"
             yield log_acc, "", "Exporting to SSD..."
-
             engine.save_master(temp_path) 
+            
+            del engine
+            torch.cuda.empty_cache()
+            gc.collect()
+            
             log_acc += f"✅ MASTER SAVED: {os.path.getsize(temp_path)/1e9:.1f} GB\n"
             yield log_acc, "", "Export Complete"
 
-        # 4. QUANTIZATION / EXPORT
+        # 4. QUANTIZATION / EXPORT (MATCH-CASE)
         torch.cuda.empty_cache()
         gc.collect()
 
-        if q_format != "None (FP16 Master)":
-            if "GGUF_" in q_format:
-                q_type = q_format.replace("GGUF_", "")
+        match q_format:
+            case "None (FP16 Master)":
+                yield log_acc + "✅ MASTER FP16 READY ON SSD.\n", temp_path, "Finished"
+            
+            case str(f) if "GGUF_" in f:
+                q_type = f.replace("GGUF_", "")
                 final_name = f"WAN22_{recipe_slug}_{q_type}.gguf"
                 final_path = os.path.join(final_dir, final_name)
                 cmd = ["python", "convert.py", "--src", temp_path, "--dst", final_path, "--outtype", q_type]
-            else:
+                yield from execute_export_logic(cmd, final_name, final_path, q_format, auto_move, final_dir, log_acc)
+            
+            case _:
                 final_name = f"WAN22_{recipe_slug}_{q_format}.safetensors"
                 final_path = os.path.join(final_dir, final_name)
                 cmd = ["convert_to_quant", "-i", temp_path, "-o", final_path, "--comfy_quant", "--wan"]
                 if q_format == "int8": cmd += ["--int8", "--block_size", "128"]
                 elif q_format == "nvfp4": cmd += ["--nvfp4"]
-
-            yield log_acc + f"🔨 STARTING EXPORT: {final_name}...\n", "", f"Quantizing {q_format}..."
-            
-            # Use Popen to allow interruption
-            active_process = subprocess.Popen(cmd)
-            active_process.wait()
-            
-            if active_process and active_process.returncode != 0:
-                raise Exception(f"Quantization failed (Code {active_process.returncode})")
-            
-            active_process = None
-
-            if auto_move and final_dir == RAMDISK_PATH:
-                shutil.move(final_path, os.path.join(MODELS_DIR, final_name))
-                final_path = os.path.join(MODELS_DIR, final_name)
-
-            log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
-            yield log_acc, final_path, "Process Finished"
-        else:
-            yield log_acc + "✅ MASTER FP16 READY ON SSD.\n", temp_path, "Finished"
+                yield from execute_export_logic(cmd, final_name, final_path, q_format, auto_move, final_dir, log_acc)
 
     except Exception as e:
         log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
         yield log_acc, "", "Critical Error"
     finally:
-        # UNIVERSAL LOGGING
         try:
             log_filename = f"merge_{recipe_slug}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            log_path = os.path.join(LOGS_DIR, log_filename)
-            with open(log_path, "w", encoding="utf-8") as f:
+            with open(os.path.join(LOGS_DIR, log_filename), "w", encoding="utf-8") as f:
                 f.write(log_acc)
         except: pass
-        
         active_process = None
         torch.cuda.empty_cache()
+
+# --- REUSABLE EXPORT HELPER ---
+def execute_export_logic(cmd, final_name, final_path, q_format, auto_move, final_dir, log_acc):
+    global active_process
+    yield log_acc + f"🔨 STARTING EXPORT: {final_name}...\n", "", f"Quantizing {q_format}..."
+    
+    # Use Popen to keep it interruptible by the STOP button
+    active_process = subprocess.Popen(cmd)
+    active_process.wait()
+    
+    # Check if it was stopped by the user or crashed
+    if active_process is None: # Means stop_pipeline was called
+         yield log_acc + "🛑 EXPORT CANCELLED BY USER.\n", "", "Stopped"
+         return
+
+    if active_process.returncode != 0:
+        raise Exception(f"Quantization failed (Code {active_process.returncode})")
+    
+    active_process = None
+    if auto_move and final_dir == RAMDISK_PATH:
+        shutil.move(final_path, os.path.join(MODELS_DIR, final_name))
+        final_path = os.path.join(MODELS_DIR, final_name)
+    log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
+    yield log_acc, final_path, "Process Finished"
 
 # --- UI LAYOUT ---
 

@@ -1,5 +1,6 @@
 import os
 import torch
+import psutil
 
 # --- HARDWARE OPTIMIZATIONS ---
 # Enable TF32 for ~2x faster math on Ampere+ GPUs
@@ -53,6 +54,10 @@ JS_AUTO_SCROLL = """
     if (el) { el.scrollTop = el.scrollHeight; }
 }
 """
+
+def get_ram_threshold_met():
+    """Returns True if available RAM is below 15% (Critical for 14B models)"""
+    return psutil.virtual_memory().percent > 85
 
 def ensure_dirs():
     for d in [MODELS_DIR, RECIPES_DIR, LOGS_DIR]:
