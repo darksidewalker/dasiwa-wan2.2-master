@@ -104,18 +104,18 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             summary_table = get_final_summary_string(engine.summary_data, engine.role_label)
             log_acc += summary_table + "\n"
 
-            # NEW: Clear memory before the heavy save call
-            torch.cuda.empty_cache()
-            gc.collect()
-
-            log_acc += f"💾 EXPORT: Writing Master to SSD: {temp_path}...\n"
-            yield log_acc, "", "💾 WRITING TO SSD (DO NOT CLOSE)" # Feedback added
+            log_acc += f"💾 EXPORT: Writing 14B Master to SSD: {temp_path}...\n"
+            log_acc += "⚠️ SYSTEM MAY BECOME UNRESPONSIVE DURING WRITE\n"
+            yield log_acc, "", "💾 WRITING TO SSD..." # This keeps the UI active
             
             engine.save_master(temp_path) 
             
-            # Wipe the engine object immediately
             del engine
             gc.collect()
+            torch.cuda.empty_cache()
+            
+            log_acc += f"✅ MASTER SAVED SUCCESSFULLY.\n"
+            yield log_acc, temp_path, "Process Finished"
 
         match q_format:
             case "None (FP16 Master)":

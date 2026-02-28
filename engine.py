@@ -268,26 +268,32 @@ class ActionMasterEngine:
         return f"{header}\n{summary_text}\n🚀 Made with DaSiWa"
 
     def save_master(self, path):
-        """Memory-optimized save to prevent system lock during 14B writes."""
+        """Ultra-Stable Save: Destroys old tensor memory immediately to prevent 14B freeze."""
         metadata_str = self.get_metadata_string()
         custom_metadata = {
             "comment": metadata_str, 
             "dasiwa_summary": metadata_str
         }
         
-        # 1. PRE-SAVE PURGE: Clear every possible byte of VRAM/RAM
         self._cleanup() 
+        print(f"📦 Pre-Processing 14B Tensors (Sequential Alignment)...")
         
         try:
-            # 2. CONTIGUOUS CHECK: Process one tensor at a time to avoid mass spikes
             with torch.no_grad():
                 for k in self.base_keys:
                     if not self.base_dict[k].is_contiguous():
-                        # Use .to() to move and clean in one step if needed
-                        self.base_dict[k] = self.base_dict[k].contiguous()
+                        # DESTRUCTIVE UPDATE: Move to CPU, align, then delete the original reference
+                        original_tensor = self.base_dict[k]
+                        self.base_dict[k] = original_tensor.contiguous().to("cpu")
+                        
+                        # Explicitly kill the old pointer to free RAM before next iteration
+                        del original_tensor
+                        
+                        # Every 100 layers, force the OS to reclaim the freed memory
+                        if "layers.20" in k or "layers.40" in k:
+                            gc.collect()
 
-            # 3. DIRECT SAVE: Write to SSD
-            print(f"💾 SSD WRITE STARTING: {os.path.basename(path)}")
+            print(f"💾 SSD WRITE STARTING: {os.path.basename(path)} (Approx 2-5 mins)")
             save_file(self.base_dict, path, metadata=custom_metadata)
             return path
             
@@ -295,7 +301,7 @@ class ActionMasterEngine:
             print(f"❌ SSD WRITE CRASHED: {str(e)}")
             raise e
         finally:
-            # 4. IMMEDIATE RELEASE: Destroy the 26GB dictionary
+            # Immediate wipe of the 26GB dictionary
             self.base_dict = None 
             self._cleanup()
 
