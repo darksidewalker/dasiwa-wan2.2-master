@@ -20,19 +20,33 @@ class ActionMasterEngine:
         self.base_keys = list(self.base_dict.keys())
 
     def soft_normalize(self):
-            """Re-calibrates tensor variance to prevent 14B MoE collapse."""
-            with torch.no_grad():
-                for key in self.base_keys:
-                    w = self.base_dict[key]
-                    # We only normalize weight tensors, not biases or scales
-                    if "weight" in key and w.ndim >= 2:
-                        w_float = w.to(torch.float32)
-                        std = torch.std(w_float)
-                        # If variance drifts > 5% from standard, we pull it back
-                        if std > 1.05:
-                            scale = 1.0 / std
-                            self.base_dict[key] = (w_float * scale).to(w.dtype)
-            return "  ✨ Normalization Complete: Tensors re-aligned to Base Signal."
+        """Re-calibrates tensor variance with real-time feedback."""
+        count = 0
+        total_reduction = 0.0
+        
+        with torch.no_grad():
+            for key in self.base_keys:
+                w = self.base_dict[key]
+                if "weight" in key and w.ndim >= 2:
+                    w_float = w.to(torch.float32)
+                    std = torch.std(w_float)
+                    
+                    # If variance drifts > 5% from standard
+                    if std > 1.05:
+                        scale = 1.0 / std
+                        reduction = (1.0 - scale.item()) * 100
+                        self.base_dict[key] = (w_float * scale).to(w.dtype)
+                        total_reduction += reduction
+                        count += 1
+        
+        if count > 0:
+            avg_red = total_reduction / count
+            msg = f"  ✨ NORM: Recalibrated {count} tensors (Avg Reduction: -{avg_red:.2f}%)"
+        else:
+            msg = "  ✨ NORM: Tensors already stable. No adjustment needed."
+            
+        print(msg) # CLI Feedback
+        return msg # GUI Feedback
 
     def get_compatibility_report(self):
         forbidden = "low" if self.is_motion_base else "high"
