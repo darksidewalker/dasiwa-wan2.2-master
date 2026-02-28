@@ -4,8 +4,11 @@ from config import *
 from utils import get_sys_info, instant_validate, get_final_summary_string, sync_ram_to_ssd
 from engine import ActionMasterEngine
 
+# Global handle for the background process
 active_process = None
 ensure_dirs()
+
+# --- HELPER FUNCTIONS ---
 
 def list_files():
     m = sorted([f for f in os.listdir(MODELS_DIR) if f.endswith(('.safetensors', '.gguf'))])
@@ -14,20 +17,34 @@ def list_files():
 
 def load_recipe_text(name):
     if not name: return ""
-    with open(os.path.join(RECIPES_DIR, name), 'r') as f: return f.read()
+    try:
+        with open(os.path.join(RECIPES_DIR, name), 'r') as f: return f.read()
+    except: return "❌ Error loading recipe."
+
+def stop_pipeline():
+    """Emergency Brake: Kills subprocess and flushes VRAM."""
+    global active_process
+    if active_process:
+        print("🛑 STOP SIGNAL: Terminating subprocess...")
+        active_process.terminate()
+        active_process = None
+    
+    torch.cuda.empty_cache()
+    gc.collect()
+    return "🛑 PROCESS TERMINATED BY USER\n" + "-"*60, "Idle"
+
+# --- MAIN PIPELINE ---
 
 def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, progress=gr.Progress()):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
     global active_process
     
-    # PATH SEPARATION
-    recipe_slug = recipe_name.replace(".json", "")
+    recipe_slug = recipe_name.replace(".json", "") if recipe_name else "custom_merge"
     cache_name = f"MASTER_{recipe_slug}.safetensors"
-    temp_path = os.path.join(MODELS_DIR, cache_name) # Always SSD
-    final_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR # Always RAM Disk
+    temp_path = os.path.join(MODELS_DIR, cache_name)
+    final_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
     
-    # SMART SKIP LOGIC
     master_exists = os.path.exists(temp_path) and os.path.getsize(temp_path) > 1e9
     skip_merge = master_exists and q_format != "None (FP16 Master)"
     
@@ -39,8 +56,6 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         else:
             # 1. SETUP & ENGINE INIT
             progress(0.05, desc="Initializing Engine...")
-            yield log_acc, "", "Initializing Engine..."
-            
             clean_json = re.sub(r'//.*', '', recipe_json)
             recipe_dict = json.loads(clean_json)
             
@@ -52,18 +67,13 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
 
             # VALIDATION HEADER
             mismatches = engine.get_compatibility_report()
-            border = "=" * 60
-            header = f"\n{border}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{border}\n"
-            
+            log_acc += f"\n{'='*60}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{'='*60}\n"
             if mismatches:
-                header += f"❌ CONFLICT: {len(mismatches)} LoRA(s) mismatch noise levels!\n"
-                for m in mismatches: header += f"   - [WARN] {m}\n"
-                header += f"{border}\n⚠️  PROCEEDING WITH CAUTION...\n\n"
+                log_acc += f"❌ CONFLICT: {len(mismatches)} LoRA(s) mismatch noise levels!\n"
+                for m in mismatches: log_acc += f"   - [WARN] {m}\n"
             else:
-                header += "✅ ALL SYSTEMS CLEAR: Alignment Verified.\n"
-                header += f"{border}\n\n"
-
-            log_acc += header
+                log_acc += "✅ ALL SYSTEMS CLEAR: Alignment Verified.\n"
+            log_acc += f"{'='*60}\n\n"
             yield log_acc, "", "Merging Layers..."
 
             # 2. MERGING LOOP
@@ -73,12 +83,10 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             for i, step in enumerate(pipeline):
                 p_name = step.get('pass_name', f"Pass {i+1}")
                 progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
-                
                 log_acc += f"▶️ {p_name.upper()} | Mode: {step.get('method', 'ADDITION').upper()}\n"
                 yield log_acc, "", f"Merging: {p_name}"
                 
                 engine.process_pass(step, global_mult)
-                
                 last_pass = engine.summary_data[-1]
                 peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
                 log_acc += f"  └─ Injection: {last_pass['inj']:.1f}% | Shift: {last_pass['delta']:.8f}{peak_str}\n"
@@ -87,22 +95,14 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             # 3. SAVE MASTER (SSD)
             progress(0.8, desc="Exporting to SSD...")
             log_acc += get_final_summary_string(engine.summary_data, engine.role_label) + "\n"
-            log_acc += f"💾 EXPORT: Writing 28GB Master to SSD: {temp_path}...\n"
-            log_acc += "⚠️ UI may pause briefly during I/O write...\n"
+            log_acc += f"💾 EXPORT: Writing Master to SSD: {temp_path}...\n"
             yield log_acc, "", "Exporting to SSD..."
 
             engine.save_master(temp_path) 
-            
-            if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1e9:
-                error_msg = f"❌ SAVE ERROR: Master file missing or corrupt at {temp_path}"
-                log_acc += error_msg + "\n"
-                yield log_acc, "", "Save Failed"
-                return "🛑 Save Failure", "", "Error"
-                
             log_acc += f"✅ MASTER SAVED: {os.path.getsize(temp_path)/1e9:.1f} GB\n"
             yield log_acc, "", "Export Complete"
 
-        # 4. QUANTIZATION / EXPORT (RAM Disk)
+        # 4. QUANTIZATION / EXPORT
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -111,40 +111,31 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 q_type = q_format.replace("GGUF_", "")
                 final_name = f"WAN22_{recipe_slug}_{q_type}.gguf"
                 final_path = os.path.join(final_dir, final_name)
-                
-                yield log_acc + f"🔨 GGUF: {q_type} -> {final_path}\n", "", f"GGUF {q_type}..."
-                # Use --src and --dst as required by convert.py
                 cmd = ["python", "convert.py", "--src", temp_path, "--dst", final_path, "--outtype", q_type]
             else:
                 final_name = f"WAN22_{recipe_slug}_{q_format}.safetensors"
                 final_path = os.path.join(final_dir, final_name)
-                
-                yield log_acc + f"🔨 PIP PACKAGE: {q_format.upper()} -> {final_path}\n", "", f"Quantizing {q_format}..."
-                
-                # SPECIFIC QUANT FLAGS
                 cmd = ["convert_to_quant", "-i", temp_path, "-o", final_path, "--comfy_quant", "--wan"]
-                if q_format == "int8":
-                    cmd += ["--int8", "--block_size", "128"]
-                elif q_format == "nvfp4":
-                    cmd += ["--nvfp4"]
+                if q_format == "int8": cmd += ["--int8", "--block_size", "128"]
+                elif q_format == "nvfp4": cmd += ["--nvfp4"]
 
-            subprocess.run(cmd, check=True)
+            yield log_acc + f"🔨 STARTING EXPORT: {final_name}...\n", "", f"Quantizing {q_format}..."
             
-            # AUTO MOVE
+            # Use Popen to allow interruption
+            active_process = subprocess.Popen(cmd)
+            active_process.wait()
+            
+            if active_process and active_process.returncode != 0:
+                raise Exception(f"Quantization failed (Code {active_process.returncode})")
+            
+            active_process = None
+
             if auto_move and final_dir == RAMDISK_PATH:
                 shutil.move(final_path, os.path.join(MODELS_DIR, final_name))
                 final_path = os.path.join(MODELS_DIR, final_name)
 
             log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
             yield log_acc, final_path, "Process Finished"
-
-            log_filename = f"merge_{recipe_slug}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            log_path = os.path.join(LOGS_DIR, log_filename)
-
-            # Write the terminal feed to the logs folder
-            with open(log_path, "w", encoding="utf-8") as f:
-                f.write(log_acc)
-
         else:
             yield log_acc + "✅ MASTER FP16 READY ON SSD.\n", temp_path, "Finished"
 
@@ -152,20 +143,28 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
         log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
         yield log_acc, "", "Critical Error"
     finally:
+        # UNIVERSAL LOGGING
+        try:
+            log_filename = f"merge_{recipe_slug}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            log_path = os.path.join(LOGS_DIR, log_filename)
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(log_acc)
+        except: pass
+        
         active_process = None
+        torch.cuda.empty_cache()
+
+# --- UI LAYOUT ---
 
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     with gr.Row():
         with gr.Column(scale=4): 
             gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**14B High-Precision MoE Pipeline**")
         with gr.Column(scale=3):
-            with gr.Group(elem_classes="vitals-card"):
-                vitals_box = gr.Textbox(label="System Health", value=get_sys_info(), lines=3, interactive=False)
-                gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
+            vitals_box = gr.Textbox(label="System Health", value=get_sys_info(), lines=3, interactive=False)
+            gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
         with gr.Column(scale=3):
-            with gr.Group(elem_classes="vitals-card"):
-                pipeline_status = gr.Label(label="Current Stage", value="Idle")
-                main_progress = gr.Progress(track_tqdm=True)
+            pipeline_status = gr.Label(label="Current Stage", value="Idle")
 
     with gr.Row():
         with gr.Column(scale=2):
@@ -176,36 +175,42 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
                 refresh_btn = gr.Button("🔄 Refresh Assets", size="sm")
             with gr.Group():
                 quant_select = gr.Radio(
-                    choices=[
-                        "None (FP16 Master)", 
-                        "fp8", "nvfp4", "int8", 
-                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q5_K_M", 
-                        "GGUF_Q4_K_M", "GGUF_Q3_K_M", "GGUF_Q2_K"
-                    ], 
-                    value="None (FP16 Master)", 
-                    label="Target Format"
+                    choices=["None (FP16 Master)", "fp8", "nvfp4", "int8", "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q4_K_M", "GGUF_Q2_K"], 
+                    value="None (FP16 Master)", label="Target Format"
                 )
                 auto_move_toggle = gr.Checkbox(label="🚀 Move to SSD on Success", value=False)
             with gr.Row():
                 start_btn = gr.Button("🔥 START", variant="primary", scale=2)
                 stop_btn = gr.Button("🛑 STOP", variant="stop", scale=1)
+            
+            sync_trigger = gr.Button("📤 Manual Move to SSD", variant="secondary")
             last_path_state = gr.State("")
 
         with gr.Column(scale=5):
             with gr.Tabs():
-                with gr.Tab("💻 Terminal Feed"): terminal_box = gr.Textbox(lines=28, interactive=False, elem_id="terminal", show_label=False)
-                with gr.Tab("📝 Recipe Editor"): recipe_editor = gr.Code(language="json", lines=28)
+                with gr.Tab("💻 Terminal"): terminal_box = gr.Textbox(lines=28, interactive=False, show_label=False, elem_id="terminal")
+                with gr.Tab("📝 Editor"): recipe_editor = gr.Code(language="json", lines=28)
 
-    # Bindings
+    # --- BINDINGS ---
     demo.load(list_files, outputs=[base_dd, recipe_dd])
     refresh_btn.click(list_files, outputs=[base_dd, recipe_dd])
     recipe_dd.change(load_recipe_text, inputs=[recipe_dd], outputs=[recipe_editor])
     recipe_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
-    start_btn.click(fn=run_pipeline, inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], outputs=[terminal_box, last_path_state, pipeline_status])
-    terminal_box.change(fn=None, js=JS_AUTO_SCROLL)
+    base_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
+    
+    # Logic for Start/Stop
+    run_event = start_btn.click(
+        fn=run_pipeline, 
+        inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], 
+        outputs=[terminal_box, last_path_state, pipeline_status],
+        show_progress="hidden"
+    )
+    
+    stop_btn.click(fn=stop_pipeline, outputs=[terminal_box, pipeline_status], cancels=[run_event])
     sync_trigger.click(fn=sync_ram_to_ssd, inputs=[last_path_state], outputs=[terminal_box])
+    
+    terminal_box.change(fn=None, js=JS_AUTO_SCROLL)
 
-# --- THE CLEAN SHUTDOWN ---
 if __name__ == "__main__":
     try:
         demo.launch(css=CSS_STYLE) 
