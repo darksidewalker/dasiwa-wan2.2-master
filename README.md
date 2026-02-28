@@ -1,6 +1,6 @@
 # 🌀 DaSiWa WAN 2.2 Master: Merger & Quantizer (WIP)
 
-DaSiWa WAN 2.2 Master is a high-performance industrial toolkit designed for merging and quantizing Wan 2.2 (14B) Video Models. Specifically engineered for systems with 64GB RAM and NVIDIA Ada (40-series) or Blackwell (50-series) GPUs, it leverages a 55GB RAMDisk to eliminate SSD bottlenecking and maximize tensor throughput.
+DaSiWa WAN 2.2 Master is a high-performance industrial toolkit designed for merging and quantizing Wan 2.2 (14B) Video Models. Specifically engineered for systems with 64GB RAM and NVIDIA Ada (40-series) or Blackwell (50-series) GPUs.
 
 ## ✨ Key Features
 
@@ -16,8 +16,6 @@ DaSiWa WAN 2.2 Master is a high-performance industrial toolkit designed for merg
 
 💎 Next-Gen FP Quants: Native support for NVFP4 (Blackwell) and FP8 E4M3 (Ada) via optimized convert_to_quant integration.
 
-⚡ RAMDisk-First I/O: Maps all heavy-lift operations to /mnt/ramdisk to protect SSD health and increase conversion speed by up to 4x.
-
 🛡️ 64GB Safety Logic: Intelligent memory flushing and subprocess monitoring to prevent OOM (Out of Memory) crashes during 14B model handling.
 
 ## 🚀 Quick Start
@@ -32,7 +30,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### Installation & Launch
 
-The included start.sh handles RAMDisk mounting, environment syncing, and build requirements automatically.
+The included start.sh environment syncing, and build requirements automatically.
 Bash
 ```
 chmod +x start.sh
@@ -55,18 +53,6 @@ chmod +x start.sh
     recipes/: Store your .json merge configurations here.
 
     logs/: Automated session logs for debugging merge weights.
-
-    /mnt/ramdisk/: Active workspace for quantization (volatile).
-
-### ⚠️ Memory Management for 64GB Systems
-
-The 55GB RAMDisk consumes a large portion of system memory. To ensure stability:
-
-    Intermediate Cache: The engine saves a high-precision BF16 Master to SSD before quantizing to RAMDisk. If a quant fails, you can restart from this cache.
-
-    Vitals Monitor: Always monitor the Station Health bar in the GUI. If RAM usage exceeds 92%, terminate the process using the 🛑 STOP button.
-
-    Sync to SSD: Once a conversion is successful, use the "Manual Move to SSD" button to free up RAMDisk space before starting the next run.
 
 ### The Action-Master "Injection" Architecture
 

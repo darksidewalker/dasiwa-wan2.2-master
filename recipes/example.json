@@ -15,6 +15,7 @@
       "method": "addition",
       "description": "HINT: Use 'addition' for Distilled/Foundation LoRAs to keep 100% precision without gating.",
       "density": 1.0,
+      "normalize": true,
       "features": [
         {
           "file": "wan2.2_distilled_engine.safetensors",
