@@ -83,3 +83,37 @@ def get_final_summary_string(summary_data, role_label):
     lines.append(f"{'STABILITY CHECK (14B CALIBRATION)':<76} | {icon} {status}")
     lines.append("="*105 + "\n")
     return "\n".join(lines)
+
+def verify_model_integrity(base_dict, base_keys, router_regex):
+    """
+    Stand-alone diagnostic to scan for NaN/Inf and MoE corruption.
+    Passes back messages via generator for the Web UI.
+    """
+    yield "  🛡️ FINAL INTEGRITY CHECK: Scanning 14B Tensors..."
+    
+    nan_count = 0
+    warnings = []
+    
+    with torch.no_grad():
+        for key in base_keys:
+            w = base_dict[key]
+            
+            # 1. Numerical Death Scan
+            if torch.isnan(w).any() or torch.isinf(w).any():
+                nan_count += 1
+                yield f"  ❌ CRITICAL: NaN/Inf detected in {key}"
+
+            # 2. Router Health Scan
+            if router_regex.search(key):
+                # Standard deviation on GPU for speed
+                std = torch.std(w.to("cuda", dtype=torch.float32)).item()
+                if std > 1.5 or std < 0.0001:
+                    warnings.append(f"Router {key} std: {std:.4f}")
+
+    if nan_count > 0:
+        raise ValueError(f"Aborting: {nan_count} corrupted tensors found.")
+    
+    if warnings:
+        yield f"  ⚠️ {len(warnings)} MoE stability warnings found."
+    
+    yield "  💎 INTEGRITY VERIFIED: 14B Model stable for export."

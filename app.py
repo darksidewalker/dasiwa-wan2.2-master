@@ -38,11 +38,13 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, progress=gr.Pro
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
     global active_process
     
+    # Setup naming and paths
     recipe_slug = recipe_name.replace(".json", "") if recipe_name else "custom_merge"
     cache_name = f"MASTER_{recipe_slug}.safetensors"
     temp_path = os.path.join(MODELS_DIR, cache_name)
     final_dir = MODELS_DIR
     
+    # Check if we can skip the heavy 14B merge loop
     master_exists = os.path.exists(temp_path) and os.path.getsize(temp_path) > 1e9
     skip_merge = master_exists and q_format != "None (FP16 Master)"
     
@@ -52,7 +54,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, progress=gr.Pro
             log_acc += "⏭️ Skipping Merge Loop and jumping to Quantization...\n\n"
             yield log_acc, "", "Fast Tracking..."
         else:
-            # 1. SETUP & ENGINE INIT
+            # 1. SETUP & ENGINE INIT (64GB RAM Optimized)
             progress(0.05, desc="Initializing Engine...")
             clean_json = re.sub(r'//.*', '', recipe_json)
             recipe_dict = json.loads(clean_json)
@@ -60,6 +62,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, progress=gr.Pro
             recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
             recipe_dict['paths']['title'] = recipe_dict['paths'].get('title', recipe_slug)
             
+            # ActionMasterEngine now contains the self.router_regex
             engine = ActionMasterEngine(recipe_dict)
 
             # VALIDATION HEADER
@@ -73,7 +76,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, progress=gr.Pro
             log_acc += f"{'='*60}\n\n"
             yield log_acc, "", "Merging Layers..."
 
-            # 2. MERGING LOOP (CLEAN & INTERRUPTIBLE)
+            # 2. MERGING LOOP (INTERRUPTIBLE & GPU-ACCELERATED)
             pipeline = recipe_dict.get('pipeline', [])
             global_mult = recipe_dict['paths'].get('global_weight_factor', 1.0)
 
@@ -81,35 +84,51 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, progress=gr.Pro
                 p_name = step.get('pass_name', f"Pass {i+1}")
                 progress(0.1 + (i/len(pipeline) * 0.6), desc=f"Merging {p_name}")
                 
-                # RUN THE ENGINE ONCE
-                # This loop handles all the real-time "Analyzing..." messages
+                # A. RUN THE SURGICAL MERGE PASS (Shields Routers + Uses Pinned Memory)
                 for message in engine.process_pass(step, global_mult):
                     log_acc += message + "\n"
                     yield log_acc, "", f"Working: {p_name}"
                 
-                # ACCESS SUMMARY ONLY AFTER THE ENGINE FINISHES THE PASS
+                # Update Summary UI
                 if engine.summary_data:
                     last_pass = engine.summary_data[-1]
-                    peak_str = f" | ⚠️ PEAKS: {last_pass['peaks']}" if last_pass['peaks'] > 0 else ""
-                    
-                    log_acc += "-"*60 + "\n"
-                    
+                    # Update summary visualization if needed
                     yield log_acc, "", f"Finished: {p_name}"
                 else:
                     log_acc += f"⚠️ {p_name} produced no summary data. Check LoRA files.\n"
                     yield log_acc, "", "Warning: Empty Pass"
 
-            # 3. SAVE MASTER (SSD)
-            progress(0.8, desc="Finalizing Tensors...")
+            # 3. FINAL INTEGRITY CHECK (The "Final Gate" from utils.py)
+            progress(0.75, desc="Verifying 14B Integrity...")
+            log_acc += "\n" + "="*60 + "\n"
+            
+            # Importing the utility we moved earlier
+            from utils import verify_model_integrity
+            
+            # This prevents the "SSD Save Crash" by catching NaNs in RAM
+            try:
+                for diag_msg in verify_model_integrity(engine.base_dict, engine.base_keys, engine.router_regex):
+                    log_acc += diag_msg + "\n"
+                    yield log_acc, "", "🛡️ Verifying Tensors..."
+            except Exception as integrity_error:
+                log_acc += f"\n🔥 INTEGRITY FAILURE: {str(integrity_error)}\n"
+                log_acc += "🛑 EMERGENCY STOP: Save aborted to prevent system hang.\n"
+                yield log_acc, "", "Verification Failed"
+                return # Stop the pipeline before it hits the hardware write
+
+            # 4. SAVE MASTER (SSD)
+            progress(0.85, desc="Finalizing Master File...")
             summary_table = get_final_summary_string(engine.summary_data, engine.role_label)
-            log_acc += summary_table + "\n"
+            log_acc += "\n" + summary_table + "\n"
 
             log_acc += f"💾 EXPORT: Writing 14B Master to SSD: {temp_path}...\n"
             log_acc += "⚠️ SYSTEM MAY BECOME UNRESPONSIVE DURING WRITE\n"
-            yield log_acc, "", "💾 WRITING TO SSD..." # This keeps the UI active
+            yield log_acc, "", "💾 WRITING TO SSD..." 
             
+            # Save master includes the contiguous-tensor and os.sync() safety
             engine.save_master(temp_path) 
             
+            # Immediate RAM Release
             del engine
             gc.collect()
             torch.cuda.empty_cache()
@@ -117,6 +136,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, progress=gr.Pro
             log_acc += f"✅ MASTER SAVED SUCCESSFULLY.\n"
             yield log_acc, temp_path, "Process Finished"
 
+        # 5. QUANTIZATION LOGIC (Untrimmed)
         match q_format:
             case "None (FP16 Master)":
                 yield log_acc + "✅ MASTER FP16 READY ON SSD.\n", temp_path, "Finished"
@@ -140,8 +160,10 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, progress=gr.Pro
         log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
         yield log_acc, "", "Critical Error"
     finally:
+        # Final cleanup and logging
         try:
             log_filename = f"merge_{recipe_slug}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            if not os.path.exists(LOGS_DIR): os.makedirs(LOGS_DIR)
             with open(os.path.join(LOGS_DIR, log_filename), "w", encoding="utf-8") as f:
                 f.write(log_acc)
         except: pass
