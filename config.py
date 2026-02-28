@@ -26,6 +26,25 @@ CSS_STYLE = """
     border-radius: 8px; 
     background: #0d1117; 
 }
+.primary-button {
+    background: linear-gradient(135deg, #28a745 0%, #1e7e34 100%) !important;
+    color: white !important;
+    border: 1px solid #145523 !important;
+    font-weight: bold !important;
+    text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+}
+
+.primary-button:hover {
+    background: #218838 !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+}
+
+/* Keep the Stop button Red */
+.stop-button {
+    background: #dc3545 !important;
+    color: white !important;
+}
 """
 
 JS_AUTO_SCROLL = """
