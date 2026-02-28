@@ -19,6 +19,21 @@ class ActionMasterEngine:
         self.base_dict = load_file(base_path)
         self.base_keys = list(self.base_dict.keys())
 
+    def soft_normalize(self):
+            """Re-calibrates tensor variance to prevent 14B MoE collapse."""
+            with torch.no_grad():
+                for key in self.base_keys:
+                    w = self.base_dict[key]
+                    # We only normalize weight tensors, not biases or scales
+                    if "weight" in key and w.ndim >= 2:
+                        w_float = w.to(torch.float32)
+                        std = torch.std(w_float)
+                        # If variance drifts > 5% from standard, we pull it back
+                        if std > 1.05:
+                            scale = 1.0 / std
+                            self.base_dict[key] = (w_float * scale).to(w.dtype)
+            return "  ✨ Normalization Complete: Tensors re-aligned to Base Signal."
+
     def get_compatibility_report(self):
         forbidden = "low" if self.is_motion_base else "high"
         mismatches = []
@@ -179,6 +194,10 @@ class ActionMasterEngine:
 
             yield f"    └─ [{method_label}] Knowledge Kept: {current_val:.1f}% | Health: {health_status}"
 
+        if step.get('normalize', False):
+            norm_msg = self.soft_normalize()
+            yield norm_msg
+
         # Final pass summary calculation
         post_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
         shift = abs(post_mean - pre_mean)
@@ -229,12 +248,8 @@ class ActionMasterEngine:
         return "\n".join(lines)
 
     def get_metadata_string(self, quant="None"):
-        # Import the correct formatter from utils
         from utils import get_final_summary_string
-        
-        # Use the logic that already works for the UI
         summary_text = get_final_summary_string(self.summary_data, self.role_label)
-        
         header = f"Title: {self.paths.get('title', 'Dasiwa Master')}\nExport: {quant}\n"
         return f"{header}\n{summary_text}\n🚀 Made with DaSiWa"
 
