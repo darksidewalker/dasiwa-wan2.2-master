@@ -10,7 +10,6 @@ torch.backends.cudnn.allow_tf32 = True
 # --- DIRECTORIES ---
 MODELS_DIR = "models"
 RECIPES_DIR = "recipes"
-RAMDISK_PATH = "/mnt/ramdisk"
 LOGS_DIR = "logs"
 
 # --- UI ASSETS (Gradio 6 Optimized) ---

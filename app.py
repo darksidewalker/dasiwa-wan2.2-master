@@ -41,7 +41,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
     recipe_slug = recipe_name.replace(".json", "") if recipe_name else "custom_merge"
     cache_name = f"MASTER_{recipe_slug}.safetensors"
     temp_path = os.path.join(MODELS_DIR, cache_name)
-    final_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
+    final_dir = MODELS_DIR
     
     master_exists = os.path.exists(temp_path) and os.path.getsize(temp_path) > 1e9
     skip_merge = master_exists and q_format != "None (FP16 Master)"
@@ -166,9 +166,6 @@ def execute_export_logic(cmd, final_name, final_path, q_format, auto_move, final
         raise Exception(f"Quantization failed (Code {active_process.returncode})")
     
     active_process = None
-    if auto_move and final_dir == RAMDISK_PATH:
-        shutil.move(final_path, os.path.join(MODELS_DIR, final_name))
-        final_path = os.path.join(MODELS_DIR, final_name)
     log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
     yield log_acc, final_path, "Process Finished"
 
@@ -196,12 +193,10 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
                     choices=["None (FP16 Master)", "fp8", "nvfp4", "int8", "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q4_K_M", "GGUF_Q3_K_M", "GGUF_Q2_K"], 
                     value="None (FP16 Master)", label="Target Format"
                 )
-                auto_move_toggle = gr.Checkbox(label="🚀 Move to SSD on Success", value=False)
             with gr.Row():
                 start_btn = gr.Button("🔥 START", variant="primary", scale=2)
                 stop_btn = gr.Button("🛑 STOP", variant="stop", scale=1)
             
-            sync_trigger = gr.Button("📤 Manual Move to SSD", variant="secondary")
             last_path_state = gr.State("")
 
         with gr.Column(scale=5):

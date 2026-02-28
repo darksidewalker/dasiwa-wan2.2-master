@@ -20,14 +20,8 @@ def get_sys_info():
             res = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"], encoding='utf-8')
             gpu_load = f"{res.strip()}%"
         except: gpu_load = "ERR%"
-    
-    rd_status = "💾 RD: [OFFLINE]"
-    if os.path.exists(RAMDISK_PATH):
-        try:
-            usage = psutil.disk_usage(RAMDISK_PATH)
-            rd_status = f"💾 RD: {usage.used/1e9:.1f}/{usage.total/1e9:.1f}GB"
-        except: rd_status = "💾 RD: [ERR]"
-    return f"🖥️ CPU: {cpu}% | RAM: {ram}%\n📟 GPU: {gpu_load} | VRAM: {vram_info}\n{rd_status}"
+
+    return f"🖥️ CPU: {cpu}% | RAM: {ram}%\n📟 GPU: {gpu_load} | VRAM: {vram_info}\n"
 
 def instant_validate(recipe_name, base_model):
     if not recipe_name or not base_model:
