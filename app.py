@@ -175,7 +175,16 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
                 val_status_display = gr.Markdown("### 🛡️ Status: No Recipe Selected")
                 refresh_btn = gr.Button("🔄 Refresh Assets", size="sm")
             with gr.Group():
-                quant_select = gr.Radio(choices=["None (FP16 Master)", "fp8", "nvfp4", "int8", "GGUF_Q8_0", "GGUF_Q4_K_M"], value="None (FP16 Master)", label="Target Format")
+                quant_select = gr.Radio(
+                    choices=[
+                        "None (FP16 Master)", 
+                        "fp8", "nvfp4", "int8", 
+                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q5_K_M", 
+                        "GGUF_Q4_K_M", "GGUF_Q3_K_M", "GGUF_Q2_K"
+                    ], 
+                    value="None (FP16 Master)", 
+                    label="Target Format"
+                )
                 auto_move_toggle = gr.Checkbox(label="🚀 Move to SSD on Success", value=False)
             with gr.Row():
                 start_btn = gr.Button("🔥 START", variant="primary", scale=2)
