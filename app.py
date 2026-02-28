@@ -1,107 +1,11 @@
 import gradio as gr
-import psutil
-import torch
-import os
-import json
-import re
-import gc
-import subprocess
-import shutil
-import time
-import datetime
+import torch, os, gc, subprocess, shutil, datetime, re, json
+from config import *
+from utils import get_sys_info, instant_validate, get_final_summary_string, sync_ram_to_ssd
 from engine import ActionMasterEngine
 
-# --- 1. CONFIGURATION & DIRECTORIES ---
-MODELS_DIR = "models"
-RECIPES_DIR = "recipes"
-RAMDISK_PATH = "/mnt/ramdisk"
-LOGS_DIR = "logs"
-
 active_process = None
-
-for d in [MODELS_DIR, RECIPES_DIR, LOGS_DIR]:
-    os.makedirs(d, exist_ok=True)
-
-# --- 2. STYLING (Gradio 6 Optimized) ---
-CSS_STYLE = """
-#terminal textarea { 
-    background-color: #0d1117 !important; 
-    color: #00ff41 !important; 
-    font-family: 'Fira Code', monospace !important; 
-    font-size: 13px !important;
-}
-.vitals-card { 
-    border: 1px solid #30363d; 
-    padding: 15px; 
-    border-radius: 8px; 
-    background: #0d1117; 
-}
-"""
-
-JS_AUTO_SCROLL = """
-() => {
-    const el = document.querySelector('#terminal textarea');
-    if (el) { el.scrollTop = el.scrollHeight; }
-}
-"""
-
-# --- 3. SYSTEM UTILITIES ---
-def get_sys_info():
-    """Gradio 6.0 compatible system health stream."""
-    ram = psutil.virtual_memory().percent
-    cpu = psutil.cpu_percent()
-    gpu_load, vram_info = "0%", "0.0/0.0GB"
-    if torch.cuda.is_available():
-        try:
-            v_used = torch.cuda.memory_reserved() / 1e9
-            v_total = torch.cuda.get_device_properties(0).total_memory / 1e9
-            vram_info = f"{v_used:.1f}/{v_total:.1f}GB"
-            res = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"], encoding='utf-8')
-            gpu_load = f"{res.strip()}%"
-        except: gpu_load = "ERR%"
-    
-    rd_status = "💾 RD: [OFFLINE]"
-    if os.path.exists(RAMDISK_PATH):
-        try:
-            usage = psutil.disk_usage(RAMDISK_PATH)
-            rd_status = f"💾 RD: {usage.used/1e9:.1f}/{usage.total/1e9:.1f}GB"
-        except: rd_status = "💾 RD: [ERR]"
-        
-    return f"🖥️ CPU: {cpu}% | RAM: {ram}%\n📟 GPU: {gpu_load} | VRAM: {vram_info}\n{rd_status}"
-
-def instant_validate(recipe_name, base_model):
-    if not recipe_name or not base_model:
-        return "### 🛡️ Status: Waiting for selection..."
-    
-    # STRICT DETECTION: Look for noise tags only
-    model_is_high = "high_noise" in base_model.lower()
-    recipe_is_high = "high" in recipe_name.lower()
-    
-    model_label = "MOTION (High)" if model_is_high else "REFINER (Low)"
-    
-    try:
-        # Load JSON to check internal LoRA paths
-        recipe_path = os.path.join(RECIPES_DIR, recipe_name)
-        with open(recipe_path, 'r') as f:
-            content = f.read().lower()
-            
-            # Scenario A: High Model check
-            if model_is_high:
-                if "low_noise" in content or "_low" in content:
-                    return f"### ❌ MISMATCH: {model_label} Model vs. LOW LoRAs found in JSON"
-                if not recipe_is_high:
-                    return f"### ❌ MISMATCH: {model_label} Model vs. LOW Recipe filename"
-            
-            # Scenario B: Low Model check
-            else:
-                if "high_noise" in content or "_high" in content:
-                    return f"### ❌ MISMATCH: {model_label} Model vs. HIGH LoRAs found in JSON"
-                if recipe_is_high:
-                    return f"### ❌ MISMATCH: {model_label} Model vs. HIGH Recipe filename"
-
-        return f"### ✅ VALIDATED: {model_label} Architecture Alignment"
-    except Exception as e:
-        return f"### ⚠️ Status: Validation Error ({str(e)})"
+ensure_dirs()
 
 def list_files():
     m = sorted([f for f in os.listdir(MODELS_DIR) if f.endswith(('.safetensors', '.gguf'))])
@@ -112,33 +16,18 @@ def load_recipe_text(name):
     if not name: return ""
     with open(os.path.join(RECIPES_DIR, name), 'r') as f: return f.read()
 
-def sync_ram_to_ssd(path):
-    if not path or not os.path.exists(path): return "❌ Source missing."
-    dest = os.path.join(MODELS_DIR, os.path.basename(path))
-    shutil.move(path, dest)
-    return f"✅ MOVED: {os.path.basename(dest)}"
-
-def terminate_pipeline():
-    global active_process
-    if active_process:
-        active_process.terminate()
-        active_process = None
-        return "🛑 EMERGENCY STOP: Pipeline Terminated."
-    return "ℹ️ Idle."
-
-# --- 4. THE MASTER PIPELINE ---
 def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, progress=gr.Progress()):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
     global active_process
     
-    # [ROBUSTNESS: PATH SEPARATION]
+    # PATH SEPARATION
     recipe_slug = recipe_name.replace(".json", "")
     cache_name = f"MASTER_{recipe_slug}.safetensors"
     temp_path = os.path.join(MODELS_DIR, cache_name) # Always SSD
     final_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR # Always RAM Disk
     
-    # [PRESERVED: SMART SKIP LOGIC]
+    # SMART SKIP LOGIC
     master_exists = os.path.exists(temp_path) and os.path.getsize(temp_path) > 1e9
     skip_merge = master_exists and q_format != "None (FP16 Master)"
     
@@ -161,7 +50,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             
             engine = ActionMasterEngine(recipe_dict)
 
-            # [PRESERVED: VALIDATION HEADER]
+            # VALIDATION HEADER
             mismatches = engine.get_compatibility_report()
             border = "=" * 60
             header = f"\n{border}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{border}\n"
@@ -197,11 +86,11 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
 
             # 3. SAVE MASTER (SSD)
             progress(0.8, desc="Exporting to SSD...")
-            log_acc += engine.get_final_summary_string() + "\n"
+            log_acc += get_final_summary_string(engine.summary_data, engine.role_label) + "\n"
             log_acc += f"💾 EXPORT: Writing 28GB Master to SSD: {temp_path}...\n"
             log_acc += "⚠️ UI may pause briefly during I/O write...\n"
             yield log_acc, "", "Exporting to SSD..."
-            
+
             engine.save_master(temp_path) 
             
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1e9:
@@ -232,7 +121,7 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 
                 yield log_acc + f"🔨 PIP PACKAGE: {q_format.upper()} -> {final_path}\n", "", f"Quantizing {q_format}..."
                 
-                # [PRESERVED FEATURE: SPECIFIC QUANT FLAGS]
+                # SPECIFIC QUANT FLAGS
                 cmd = ["convert_to_quant", "-i", temp_path, "-o", final_path, "--comfy_quant", "--wan"]
                 if q_format == "int8":
                     cmd += ["--int8", "--block_size", "128"]
@@ -241,13 +130,21 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
 
             subprocess.run(cmd, check=True)
             
-            # [PRESERVED FEATURE: AUTO MOVE]
+            # AUTO MOVE
             if auto_move and final_dir == RAMDISK_PATH:
                 shutil.move(final_path, os.path.join(MODELS_DIR, final_name))
                 final_path = os.path.join(MODELS_DIR, final_name)
 
             log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
             yield log_acc, final_path, "Process Finished"
+
+            log_filename = f"merge_{recipe_slug}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            log_path = os.path.join(LOGS_DIR, log_filename)
+
+            # Write the terminal feed to the logs folder
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(log_acc)
+
         else:
             yield log_acc + "✅ MASTER FP16 READY ON SSD.\n", temp_path, "Finished"
 
@@ -257,103 +154,60 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
     finally:
         active_process = None
 
-# --- 5. UI CONSTRUCTION (Gradio 6.0 Compliant) ---
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     with gr.Row():
         with gr.Column(scale=4): 
             gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**14B High-Precision MoE Pipeline**")
-        
-        # COLUMN 2: RESTORED VITALS
         with gr.Column(scale=3):
             with gr.Group(elem_classes="vitals-card"):
                 vitals_box = gr.Textbox(label="System Health", value=get_sys_info(), lines=3, interactive=False)
-                # Keep the timer active so it updates every 2 seconds
                 gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
-        
-        # COLUMN 3: STAGE & PROGRESS
         with gr.Column(scale=3):
             with gr.Group(elem_classes="vitals-card"):
                 pipeline_status = gr.Label(label="Current Stage", value="Idle")
-                # This anchors the progress bar here so it stays out of the terminal
                 main_progress = gr.Progress(track_tqdm=True)
 
     with gr.Row():
         with gr.Column(scale=2):
             with gr.Group():
-                gr.Markdown("### 📂 Assets")
                 base_dd = gr.Dropdown(label="Base Model")
                 recipe_dd = gr.Dropdown(label="Active Recipe")
                 val_status_display = gr.Markdown("### 🛡️ Status: No Recipe Selected")
                 refresh_btn = gr.Button("🔄 Refresh Assets", size="sm")
-            
             with gr.Group():
-                gr.Markdown("### ⚙️ Export Configuration")
-                quant_select = gr.Radio(
-                    # FIX: Simplified string to match pipeline logic exactly
-                    choices=[
-                        "None (FP16 Master)", "fp8", "nvfp4", "int8", 
-                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q4_K_M"
-                    ], 
-                    value="None (FP16 Master)", 
-                    label="Target Format"
-                )
+                quant_select = gr.Radio(choices=["None (FP16 Master)", "fp8", "nvfp4", "int8", "GGUF_Q8_0", "GGUF_Q4_K_M"], value="None (FP16 Master)", label="Target Format")
                 auto_move_toggle = gr.Checkbox(label="🚀 Move to SSD on Success", value=False)
-                
             with gr.Row():
                 start_btn = gr.Button("🔥 START", variant="primary", scale=2)
                 stop_btn = gr.Button("🛑 STOP", variant="stop", scale=1)
-            
-            sync_trigger = gr.Button("📤 Manual Move to SSD", variant="secondary")
             last_path_state = gr.State("")
 
-        # RIGHT: Feed & Code
         with gr.Column(scale=5):
             with gr.Tabs():
-                with gr.Tab("💻 Terminal Feed"):
-                    terminal_box = gr.Textbox(lines=28, interactive=False, elem_id="terminal", show_label=False)
-                with gr.Tab("📝 Recipe Editor"):
-                    recipe_editor = gr.Code(language="json", lines=28)
+                with gr.Tab("💻 Terminal Feed"): terminal_box = gr.Textbox(lines=28, interactive=False, elem_id="terminal", show_label=False)
+                with gr.Tab("📝 Recipe Editor"): recipe_editor = gr.Code(language="json", lines=28)
 
-    # --- EVENT BINDINGS ---
+    # Bindings
     demo.load(list_files, outputs=[base_dd, recipe_dd])
     refresh_btn.click(list_files, outputs=[base_dd, recipe_dd])
-    
-    # Validator logic (Updated to check recipe contents)
     recipe_dd.change(load_recipe_text, inputs=[recipe_dd], outputs=[recipe_editor])
     recipe_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
-    base_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
-    
-    # Start Pipeline (3 Outputs to match run_pipeline yield)
-    start_btn.click(
-        fn=run_pipeline, 
-        inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], 
-        outputs=[terminal_box, last_path_state, pipeline_status],
-        show_progress="hidden" # This prevents the overlay on Textboxes
-    )
-
-    stop_btn.click(fn=terminate_pipeline, outputs=[terminal_box])
+    start_btn.click(fn=run_pipeline, inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], outputs=[terminal_box, last_path_state, pipeline_status])
     terminal_box.change(fn=None, js=JS_AUTO_SCROLL)
     sync_trigger.click(fn=sync_ram_to_ssd, inputs=[last_path_state], outputs=[terminal_box])
 
-# --- 7. LAUNCH (CSS Moved Here for Gradio 6.0) ---
+# --- THE CLEAN SHUTDOWN ---
 if __name__ == "__main__":
     try:
-        # The 'show_api=False' helps prevent some internal thread conflicts
         demo.launch(css=CSS_STYLE) 
     except KeyboardInterrupt:
         print("\n" + "!"*60)
         print("🛑 SIGNAL RECEIVED: Performing Clean Shutdown...")
-        
-        # 1. Kill the background merge/quant process if it exists
         if active_process:
             print("   - Terminating active subprocess...")
             active_process.terminate()
-            
-        # 2. Clear GPU memory to prevent driver hanging
         print("   - Flushing VRAM...")
         torch.cuda.empty_cache()
-        
         print("✅ Shutdown Complete. Terminal Safe.")
         print("!"*60 + "\n")
-        # Exit without letting the error bubble up to the OS
         os._exit(0)
