@@ -21,7 +21,7 @@ def get_sys_info():
             gpu_load = f"{res.strip()}%"
         except: gpu_load = "ERR%"
 
-    return f"🖥️ CPU: {cpu}% | RAM: {ram}%\n📟 GPU: {gpu_load} | VRAM: {vram_info}\n"
+    return f"🖥️ CPU: {cpu}% | RAM: {ram}%\n📟 GPU: {gpu_load} | VRAM: {vram_info}"
 
 def instant_validate(recipe_name, base_model):
     if not recipe_name or not base_model:

@@ -33,7 +33,7 @@ def stop_pipeline():
 
 # --- MAIN PIPELINE ---
 
-def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, progress=gr.Progress()):
+def run_pipeline(recipe_json, base_model, q_format, recipe_name, progress=gr.Progress()):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
     global active_process
