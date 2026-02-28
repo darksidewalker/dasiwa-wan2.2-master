@@ -214,13 +214,12 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     # Logic for Start/Stop
     run_event = start_btn.click(
         fn=run_pipeline, 
-        inputs=[recipe_editor, base_dd, quant_select, recipe_dd, auto_move_toggle], 
+        inputs=[recipe_editor, base_dd, quant_select, recipe_dd], # 4 args
         outputs=[terminal_box, last_path_state, pipeline_status],
         show_progress="hidden"
     )
     
     stop_btn.click(fn=stop_pipeline, outputs=[terminal_box, pipeline_status], cancels=[run_event])
-    sync_trigger.click(fn=sync_ram_to_ssd, inputs=[last_path_state], outputs=[terminal_box])
     
     terminal_box.change(fn=None, js=JS_AUTO_SCROLL)
 

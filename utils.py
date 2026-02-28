@@ -6,7 +6,7 @@ import shutil
 import re
 import json
 import gradio as gr
-from config import RAMDISK_PATH, MODELS_DIR, RECIPES_DIR
+from config import MODELS_DIR, RECIPES_DIR
 
 def get_sys_info():
     ram = psutil.virtual_memory().percent
