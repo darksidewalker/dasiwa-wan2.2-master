@@ -132,18 +132,14 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
     global active_process
     
-    # Path for intermediate master (Always SSD to prevent OOM)
+    # [ROBUSTNESS: PATH SEPARATION]
     recipe_slug = recipe_name.replace(".json", "")
     cache_name = f"MASTER_{recipe_slug}.safetensors"
-    temp_path = os.path.join(MODELS_DIR, cache_name)
+    temp_path = os.path.join(MODELS_DIR, cache_name) # Always SSD
+    final_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR # Always RAM Disk
     
-    # Path for final GGUF (Always RAM Disk if available)
-    final_dir = RAMDISK_PATH if os.path.exists(RAMDISK_PATH) else MODELS_DIR
-    
-    # --- SMART SKIP LOGIC ---
-    # Check if a valid master already exists on SSD
+    # [PRESERVED: SMART SKIP LOGIC]
     master_exists = os.path.exists(temp_path) and os.path.getsize(temp_path) > 1e9
-    # Skip merging if file exists AND we aren't explicitly asking for a new FP16 Master
     skip_merge = master_exists and q_format != "None (FP16 Master)"
     
     try:
@@ -163,10 +159,9 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
             recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
             recipe_dict['paths']['title'] = recipe_dict['paths'].get('title', recipe_slug)
             
-            # Initialize Engine
             engine = ActionMasterEngine(recipe_dict)
 
-            # --- VALIDATION HEADER ---
+            # [PRESERVED: VALIDATION HEADER]
             mismatches = engine.get_compatibility_report()
             border = "=" * 60
             header = f"\n{border}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{border}\n"
@@ -229,34 +224,37 @@ def run_pipeline(recipe_json, base_model, q_format, recipe_name, auto_move, prog
                 final_path = os.path.join(final_dir, final_name)
                 
                 yield log_acc + f"🔨 GGUF: {q_type} -> {final_path}\n", "", f"GGUF {q_type}..."
-                cmd = ["python", "convert.py", "--path", temp_path, "--dst", final_path, "--outtype", q_type]
-            
+                # Use --src and --dst as required by convert.py
+                cmd = ["python", "convert.py", "--src", temp_path, "--dst", final_path, "--outtype", q_type]
             else:
                 final_name = f"WAN22_{recipe_slug}_{q_format}.safetensors"
                 final_path = os.path.join(final_dir, final_name)
                 
                 yield log_acc + f"🔨 PIP PACKAGE: {q_format.upper()} -> {final_path}\n", "", f"Quantizing {q_format}..."
                 
-                cmd = ["convert_to_quant", "-i", temp_path, "--comfy_quant", "--wan"]
-                
+                # [PRESERVED FEATURE: SPECIFIC QUANT FLAGS]
+                cmd = ["convert_to_quant", "-i", temp_path, "-o", final_path, "--comfy_quant", "--wan"]
                 if q_format == "int8":
                     cmd += ["--int8", "--block_size", "128"]
                 elif q_format == "nvfp4":
                     cmd += ["--nvfp4"]
 
             subprocess.run(cmd, check=True)
+            
+            # [PRESERVED FEATURE: AUTO MOVE]
+            if auto_move and final_dir == RAMDISK_PATH:
+                shutil.move(final_path, os.path.join(MODELS_DIR, final_name))
+                final_path = os.path.join(MODELS_DIR, final_name)
+
             log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
             yield log_acc, final_path, "Process Finished"
         else:
             yield log_acc + "✅ MASTER FP16 READY ON SSD.\n", temp_path, "Finished"
 
-    except KeyboardInterrupt:
-        yield log_acc + "\n⚠️ Interrupted by user.\n", "", "Aborted"
     except Exception as e:
         log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
         yield log_acc, "", "Critical Error"
     finally:
-        global active_process
         active_process = None
 
 # --- 5. UI CONSTRUCTION (Gradio 6.0 Compliant) ---

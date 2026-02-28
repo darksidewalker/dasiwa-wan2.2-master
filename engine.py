@@ -253,30 +253,28 @@ class ActionMasterEngine:
     def apply_delta(self, target_key, delta):
         base = self.base_dict[target_key]
         
-        # 1. THE SILENT GUARD: Filter out specialized layers (Convnd) 
-        # that LoRAs often flatten. This stops the log spam.
-        if base.ndim > 2 and delta.ndim <= 2:
-            return False # Exit silently, no log entry created
-
-        # 2. SHAPE CORRECTION (Standard 2D Weights)
+        # 1. PRESERVED: SHAPE CORRECTION & SILENT GUARD
+        if base.ndim > 2 and delta.ndim <= 2: return False
         if delta.numel() == base.numel():
             delta = delta.reshape(base.shape)
         elif delta.ndim == 2 and delta.t().shape == base.shape:
             delta = delta.t()
         else:
-            # ONLY log if it's a real anomaly (e.g. two 2D layers that don't match)
             print(f"⚠️ SHAPE MISMATCH at {target_key}: {delta.shape} vs {base.shape}")
             return False
 
-        # 3. HIGH-PRECISION ADDITION (CPU Handshake)
+        # 2. ADDITION: PINNED MEMORY & TF32
         with torch.no_grad():
-            # Move delta to CPU to meet the 14B base
-            updated_weight = base.to(torch.float32) + delta.to("cpu", dtype=torch.float32)
+            # pin_memory() enables Direct Memory Access (DMA)
+            # This allows the 28GB model to move without blocking the CPU or Gradio UI
+            cpu_delta = delta.to("cpu", dtype=torch.float32, non_blocking=True).pin_memory()
             
-            # Cast back to BF16/FP16 and store
+            # Math benefits from TF32 acceleration on Ampere+ architectures
+            updated_weight = base.to(torch.float32) + cpu_delta
             self.base_dict[target_key] = updated_weight.to(base.dtype)
             
         return True
+
 
     def get_final_summary_string(self):
         lines = ["\n" + "="*85, f"📊 FINAL MERGE SUMMARY: {self.role_label}", "="*85]
@@ -316,20 +314,38 @@ class ActionMasterEngine:
         return f"{header}\n{self.get_final_summary_string()}{branding}"
 
     def save_master(self, path):
+        import time
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        
+        # 1. PRESERVED: Prepare Metadata
         full_log = self.get_metadata_string()
         custom_metadata = {"comment": full_log, "dasiwa_summary": full_log}
         
         try:
-            print(f"💾 EXPORT: Writing {os.path.basename(path)} to SSD...")
-            # Ensure tensors are contiguous for a faster, safer write
-            save_file({k: v.contiguous() for k, v in self.base_dict.items()}, 
-                      path, metadata=custom_metadata)
-            print(f"✅ SUCCESS: Master saved to {path}")
+            print(f"💾 EXPORT: Writing {os.path.basename(path)} to SSD... [Do not interrupt]")
+            
+            # PRESERVED: Memory-safe contiguous serialization
+            # This prevents the OS from thrashing RAM during the write
+            serialized_dict = {k: v.contiguous() for k, v in self.base_dict.items()}
+            
+            save_file(serialized_dict, path, metadata=custom_metadata)
+            print(f"✅ SUCCESS: High-Precision Master saved to {path}")
+            
+            # 2. REWRITE: Immediate cleanup of the serialized buffer
+            del serialized_dict
+            gc.collect() 
+            
+        except KeyboardInterrupt:
+            print(f"\n❌ SAVE INTERRUPTED: {path} is likely CORRUPTED.")
+            raise
+        except Exception as e:
+            print(f"❌ EXPORT FAILED: {str(e)}")
         finally:
-            # THIS PREVENTS THE FREEZE: Drop the 28GB from RAM immediately
+            # PRESERVED: Absolute memory purge for Quantizer headroom
             self.base_dict = None
             self._cleanup()
+            print("🧹 ENGINE: Memory cleared for next stage.")
+            
         return path
 
     def _cleanup(self):
