@@ -103,39 +103,65 @@ class ActionMasterEngine:
                     if any(x in k for x in [".diff", ".alpha", ".bias", "_alpha", "_bias"]): return k, None, "vector"
         return None, None, None
 
-    def calculate_delta(self, lora_sd, up_k, down_k, weight, global_mult, target_key, method, recipe_density=1.0):
-        # 🛡️ ROUTER SHIELD: Protect the MoE brain (Gates/Routers)
+    def calculate_delta(self, lora_sd, up_k, down_k, weight, global_mult, target_key, method, recipe_density):
+        # 🛡️ ROUTER SHIELD: Protect MoE Gates
         if self.router_regex.search(target_key):
             return None, 0.0, False
 
         with torch.no_grad():
-            # 🚀 GPU Speed Up: Use Pinned Memory for fast DMA Transfer
+            # Speed up with Pinned Memory -> CUDA
             up = lora_sd[up_k].to(torch.float32).pin_memory().to("cuda", non_blocking=True)
             down = lora_sd[down_k].to(torch.float32).pin_memory().to("cuda", non_blocking=True)
             
-            # Base Delta Calculation
+            # Base Delta
             delta = (up @ down) * (float(weight) * global_mult)
 
-            # --- MODE SELECTION ---
+            # --- LOGIC BRANCHING ---
             if method == "INJECTION" and recipe_density < 1.0:
-                # 🧠 SMART LOGIC: Surgical MoE-DARE (Drop And Rescale)
-                # DARE succeeds where TIES fails because it doesn't require sign-consensus 
-                # across mismatched LoRA ranks.
+                # 🧠 SURGICAL DARE: Drop and Rescale
+                # Works with different LoRA ranks where TIES fails
                 flat_delta = delta.flatten()
+                # Determine how many weights to "Drop" (1 - density)
                 k = int(flat_delta.numel() * (1.0 - recipe_density))
                 if k > 0:
-                    # Drop: Mask out the smallest values
                     threshold = torch.topk(flat_delta.abs(), k, largest=False).values[-1]
                     mask = delta.abs() > threshold
-                    # Rescale: Maintain expectation (1 / p) to keep knowledge intensity
+                    # Rescale by 1/p to conserve total energy
                     delta = torch.where(mask, delta / recipe_density, torch.zeros_like(delta))
                 passed_pct = recipe_density * 100
             else:
-                # ⚗️ ADDITION MODE: Distillation Logic
-                # Ignores density, inserts 100% of LoRA weight as requested.
+                # ⚗️ ADDITION: Pure Distillation (Ignore Density)
                 passed_pct = 100.0
 
             return delta.to("cpu"), passed_pct, True
+
+    def apply_delta(self, target_key, delta):
+        if delta is None: return False
+        base = self.base_dict[target_key]
+        
+        with torch.no_grad():
+            cpu_delta = delta.to(torch.float32)
+            base_f32 = base.to(torch.float32)
+            
+            # --- THE VIDEO KILL CURE: Norm Preservation ---
+            # Save original energy level of the expert
+            orig_norm = torch.norm(base_f32)
+            
+            # Add the LoRA knowledge
+            updated_weight = base_f32 + cpu_delta
+            
+            # Re-scale back to original Norm to keep MoE Routers calibrated
+            new_norm = torch.norm(updated_weight)
+            if new_norm > 0:
+                updated_weight = updated_weight * (orig_norm / new_norm)
+            
+            # 5-Sigma Guard
+            std, mean = torch.std_mean(base_f32)
+            limit = mean + (std * 5)
+            updated_weight = torch.clamp(updated_weight, -limit, limit)
+            
+            self.base_dict[target_key] = updated_weight.to(base.dtype)
+        return True
 
     def process_pass(self, step, global_mult):
         """
@@ -233,43 +259,6 @@ class ActionMasterEngine:
         })
         
         yield f"  ✅ {pass_name} Complete. Global Shift: {shift:.8f}"
-
-    def apply_delta(self, target_key, delta):
-        if delta is None: return False
-        base = self.base_dict[target_key]
-        
-        # Structural Validation
-        if base.ndim > 2 and delta.ndim <= 2: return False
-        if delta.numel() == base.numel(): delta = delta.reshape(base.shape)
-        elif delta.ndim == 2 and delta.t().shape == base.shape: delta = delta.t()
-        else: return False
-
-        with torch.no_grad():
-            cpu_delta = delta.to(torch.float32)
-            base_f32 = base.to(torch.float32)
-            
-            # --- THE "VIDEO KILL" CURE: Norm Preservation ---
-            # We measure the original "Energy" of the expert layer.
-            orig_norm = torch.norm(base_f32)
-            
-            # Perform the addition
-            updated_weight = base_f32 + cpu_delta
-            
-            # 🎯 Re-scale back to original Norm
-            # This allows the "Knowledge" from the LoRA to be added, but prevents
-            # the activation drift that confuses the MoE Routers.
-            new_norm = torch.norm(updated_weight)
-            if new_norm > 0:
-                updated_weight = updated_weight * (orig_norm / new_norm)
-            
-            # Expert Stability Guard (5-Sigma Clamp)
-            std, mean = torch.std_mean(base_f32)
-            limit = mean + (std * 5)
-            updated_weight = torch.clamp(updated_weight, -limit, limit)
-            
-            self.base_dict[target_key] = updated_weight.to(base.dtype)
-            
-        return True
 
     def get_final_summary_string(self):
         lines = ["\n" + "="*85, f"📊 FINAL MERGE SUMMARY: {self.role_label}", "="*85]

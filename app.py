@@ -8,8 +8,6 @@ from engine import ActionMasterEngine
 active_process = None
 ensure_dirs()
 
-# --- HELPER FUNCTIONS ---
-
 def list_files():
     m = sorted([f for f in os.listdir(MODELS_DIR) if f.endswith(('.safetensors', '.gguf'))])
     r = sorted([f for f in os.listdir(RECIPES_DIR) if f.endswith('.json')])
@@ -37,7 +35,7 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
         return
 
     # Ghost progress prevents the UI-dimming overlay
-    progress = gr.Progress(track_tensors=False) 
+    progress = gr.Progress() 
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
     
@@ -149,7 +147,6 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
         active_process = None
         torch.cuda.empty_cache()
 
-# --- REUSABLE EXPORT HELPER ---
 def execute_export_logic(cmd, final_name, final_path, q_format, auto_move, final_dir, log_acc):
     global active_process
     yield log_acc + f"🔨 STARTING EXPORT: {final_name}...\n", "", f"Quantizing {q_format}..."
@@ -171,7 +168,6 @@ def execute_export_logic(cmd, final_name, final_path, q_format, auto_move, final
     yield log_acc, final_path, "Process Finished"
 
 # --- UI LAYOUT ---
-
 with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     with gr.Row():
         with gr.Column(scale=4): 
@@ -185,8 +181,8 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     with gr.Row():
         with gr.Column(scale=2):
             with gr.Group():
-                base_dd = gr.Dropdown(label="Base Model")
-                recipe_dd = gr.Dropdown(label="Active Recipe")
+                base_dd = gr.Dropdown(label="Base Model", allow_custom_value=True)
+                recipe_dd = gr.Dropdown(label="Active Recipe", allow_custom_value=True)
                 val_status_display = gr.Markdown("### 🛡️ Status: No Recipe Selected")
                 refresh_btn = gr.Button("🔄 Refresh Assets", size="sm")
             with gr.Group():
