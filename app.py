@@ -68,6 +68,7 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
         pipeline = recipe_dict.get('pipeline', [])
         for i, step in enumerate(pipeline):
             status = f"Merging {step.get('pass_name', 'Pass')} ({i+1}/{len(pipeline)})"
+
             for message in engine.process_pass(step, recipe_dict['paths'].get('global_weight_factor', 1.0)):
                 log_acc += message + "\n"
                 yield log_acc, "", status
@@ -88,7 +89,15 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
         log_acc += "✅ SOURCE MASTER READY.\n\n"
 
         # --- 5. BATCH EXPORT (Silent Pipe to Gradio / Heavy Output to Bash) ---
-        log_acc += "📦 STARTING BATCH EXPORT QUEUE\n" + "-"*60 + "\n"
+        quants_to_process = [f for f in q_formats if "None" not in f]
+
+        if not quants_to_process:
+            log_acc += "✨ Process Finished. No quantizations requested."
+            yield log_acc, temp_path, "Idle"
+            return
+
+        log_acc += f"📦 STARTING BATCH EXPORT QUEUE ({len(quants_to_process)} formats)\n" + "-"*60 + "\n"
+        
         bf16_created_path = None
 
         for idx, fmt in enumerate(q_formats):

@@ -143,19 +143,44 @@ class ActionMasterEngine:
             cpu_delta = delta.to(torch.float32)
             base_f32 = base.to(torch.float32)
             
-            # --- THE VIDEO KILL CURE: Norm Preservation ---
-            # Save original energy level of the expert
+            # --- 🛡️ 5D TENSOR RECONCILIATION ---
+            # Wan 2.2 14B often uses [1, 1, 8, 5120, 5120] or similar for experts.
+            if base_f32.ndim == 5 and cpu_delta.ndim <= 2:
+                # Calculate the missing "Expert/Head" multiplier
+                # If base is [1, 1, 8, 5120, 5120] and delta is [5120, 5120]
+                # we need to view delta as [1, 1, 1, 5120, 5120] so it broadcasts.
+                try:
+                    # Match the trailing dimensions (the actual weight matrix)
+                    d_h, d_w = cpu_delta.shape[-2], cpu_delta.shape[-1]
+                    view_shape = list(base_f32.shape)
+                    for i in range(len(view_shape) - 2):
+                        view_shape[i] = 1 # Collapse leading dims for broadcasting
+                    
+                    cpu_delta = cpu_delta.view(view_shape)
+                except Exception:
+                    # If shapes are fundamentally incompatible (e.g., 2 vs 5120), skip it
+                    return False
+
+            # --- STRUCTURAL VALIDATION (Standard) ---
+            if cpu_delta.numel() == base_f32.numel():
+                cpu_delta = cpu_delta.reshape(base_f32.shape)
+            
+            # --- THE "VIDEO KILL" CURE: Norm Preservation ---
             orig_norm = torch.norm(base_f32)
             
-            # Add the LoRA knowledge
-            updated_weight = base_f32 + cpu_delta
+            try:
+                # The actual addition (now supports 5D broadcasting)
+                updated_weight = base_f32 + cpu_delta
+            except RuntimeError as e:
+                # Final safety: If it still fails, the LoRA is targeting a mismatched sub-layer
+                return False
             
-            # Re-scale back to original Norm to keep MoE Routers calibrated
+            # Re-scale to preserve MoE Router calibration
             new_norm = torch.norm(updated_weight)
             if new_norm > 0:
                 updated_weight = updated_weight * (orig_norm / new_norm)
             
-            # 5-Sigma Guard
+            # 5-Sigma Stability Guard
             std, mean = torch.std_mean(base_f32)
             limit = mean + (std * 5)
             updated_weight = torch.clamp(updated_weight, -limit, limit)
