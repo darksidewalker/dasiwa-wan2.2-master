@@ -33,10 +33,10 @@ def stop_pipeline():
 
 # --- MAIN PIPELINE ---
 def run_pipeline(recipe_json, base_model, q_formats, recipe_name, progress=gr.Progress()):
-    """
-    Refactored Station Master Pipeline.
-    Supports Batch Export (Checkboxes) and Surgical MoE Shielding.
-    """
+    if not q_formats:
+        yield "❌ ERROR: No export formats selected. Please check at least one.", "", "Idle"
+        return
+
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
     global active_process
@@ -44,12 +44,14 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name, progress=gr.Pr
     recipe_slug = recipe_name.replace(".json", "") if recipe_name else "custom_merge"
     cache_name = f"MASTER_{recipe_slug}.safetensors"
     temp_path = os.path.join(MODELS_DIR, cache_name)
-    final_dir = MODELS_DIR
+
+    ROOT_DIR = os.getcwd()
+    LLAMA_BIN = os.path.join(ROOT_DIR, "llama.cpp", "build", "bin", "llama-quantize")
+    CONVERT_PY = os.path.join(ROOT_DIR, "convert.py")
+    FIX_5D_PY = os.path.join(ROOT_DIR, "fix_5d_tensors.py")
     
-    # Check if a Master source already exists to avoid re-merging
     master_exists = os.path.exists(temp_path) and os.path.getsize(temp_path) > 1e9
-    
-    # Logic change: Skip merge ONLY if the Master exists AND FP16 isn't the only thing requested
+
     skip_merge = master_exists and not (len(q_formats) == 1 and "None (FP16 Master)" in q_formats)
     
     try:
@@ -58,7 +60,7 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name, progress=gr.Pr
             log_acc += "⏭️ Skipping Merge Loop and jumping to Batch Export...\n\n"
             yield log_acc, "", "Fast Tracking..."
         else:
-            # --- 1. SETUP & ENGINE INIT ---
+            # --- 1. ENGINE INIT ---
             progress(0.05, desc="Initializing Engine...")
             clean_json = re.sub(r'//.*', '', recipe_json)
             recipe_dict = json.loads(clean_json)
@@ -68,7 +70,6 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name, progress=gr.Pr
             
             engine = ActionMasterEngine(recipe_dict)
 
-            # Compatibility Reporting
             mismatches = engine.get_compatibility_report()
             log_acc += f"\n{'='*60}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{'='*60}\n"
             if mismatches:
@@ -86,17 +87,16 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name, progress=gr.Pr
             for i, step in enumerate(pipeline):
                 p_name = step.get('pass_name', f"Pass {i+1}")
                 progress(0.1 + (i/len(pipeline) * 0.5), desc=f"Merging {p_name}")
-                
                 for message in engine.process_pass(step, global_mult):
                     log_acc += message + "\n"
                     yield log_acc, "", f"Working: {p_name}"
 
-            # --- 3. FINAL INTEGRITY CHECK (PRE-SAVE GATE) ---
+            # --- 3. SAFETY GATE (INTEGRITY CHECK) ---
             progress(0.65, desc="Verifying 14B Integrity...")
             log_acc += "\n" + "="*60 + "\n"
             from utils import verify_model_integrity
-            
             try:
+                # Scan tensors in GPU/RAM before committing to SSD
                 for diag_msg in verify_model_integrity(engine.base_dict, engine.base_keys, engine.router_regex):
                     log_acc += diag_msg + "\n"
                     yield log_acc, "", "🛡️ Verifying Tensors..."
@@ -105,8 +105,8 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name, progress=gr.Pr
                 yield log_acc, "", "Verification Failed"
                 return 
 
-            # --- 4. SAVE MASTER SOURCE ---
-            progress(0.75, desc="Finalizing Master File...")
+            # --- 4. SAVE MASTER ---
+            progress(0.75, desc="Writing Master File...")
             summary_table = get_final_summary_string(engine.summary_data, engine.role_label)
             log_acc += "\n" + summary_table + "\n"
             log_acc += f"💾 EXPORT: Writing Source Master to SSD: {temp_path}...\n"
@@ -114,54 +114,85 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name, progress=gr.Pr
             
             engine.save_master(temp_path) 
             
+            # Wipe engine for 64GB RAM clearance
             del engine
             gc.collect()
             torch.cuda.empty_cache()
             log_acc += f"✅ SOURCE MASTER READY.\n\n"
 
-        # --- 5. BATCH EXPORT LOOP (With Error Isolation) ---
+        # --- 5. BATCH EXPORT QUEUE ---
         log_acc += "📦 STARTING BATCH EXPORT QUEUE\n" + "-"*60 + "\n"
         
-        for idx, fmt in enumerate(q_formats):
-            progress(0.8 + (idx/len(q_formats) * 0.2), desc=f"Exporting {fmt}...")
-            
-            if fmt == "None (FP16 Master)":
-                log_acc += "🔹 FP16 Master: Verified (Source File)\n"
-                yield log_acc, temp_path, "FP16 Ready"
-                continue
+        # Track if we created a BF16 intermediate for cleanup
+        bf16_created_path = None
 
+        for fmt in q_formats:
             try:
-                log_acc += f"🚀 Processing Format: {fmt}...\n"
-                
+                if fmt == "None (FP16 Master)":
+                    log_acc += "🔹 FP16 Master: Ready (Source)\n"
+                    yield log_acc, temp_path, "FP16 Ready"
+                    continue
+
+                # --- CASE A: GGUF WITH 5D-FIX CHAIN ---
                 if "GGUF_" in fmt:
                     q_type = fmt.replace("GGUF_", "")
-                    final_name = f"WAN22_{recipe_slug}_{q_type}.gguf"
-                    final_path = os.path.join(final_dir, final_name)
-                    cmd = ["python", "convert.py", "--src", temp_path, "--dst", final_path, "--outtype", q_type]
+                    bf16_gguf = temp_path.replace(".safetensors", "-BF16.gguf")
+                    quant_gguf = temp_path.replace(".safetensors", f"-{q_type}.gguf")
+                    
+                    # 1. Create BF16 source if missing
+                    if not os.path.exists(bf16_gguf):
+                        yield log_acc + f"📦 GGUF {q_type}: Creating BF16 GGUF...\n", "", "Step 1/3"
+                        # We use execute_export_logic to keep the STOP button active during long runs
+                        cmd_bf16 = ["python", CONVERT_PY, "--src", temp_path]
+                        for update in execute_export_logic(cmd_bf16, "BF16_Base", bf16_gguf, "BF16", False, MODELS_DIR, log_acc):
+                            if isinstance(update, tuple): yield update
+                        bf16_created_path = bf16_gguf
+
+                    # 2. llama-quantize from build folder
+                    yield log_acc + f"🔨 GGUF {q_type}: Quantizing...\n", "", "Step 2/3"
+                    cmd_quant = [LLAMA_BIN, bf16_gguf, quant_gguf, q_type]
+                    # Direct subprocess for binary logic
+                    subprocess.run(cmd_quant, check=True)
+
+                    # 3. Apply 5D Fix (Overwrites intermediate)
+                    yield log_acc + f"🔧 GGUF {q_type}: Applying 5D Fix...\n", "", "Step 3/3"
+                    cmd_fix = ["python", FIX_5D_PY, "--src", quant_gguf, "--dst", quant_gguf]
+                    subprocess.run(cmd_fix, check=True)
+                    
+                    log_acc += f"✅ GGUF {q_type} Successfully Fixed and Exported.\n"
+                    yield log_acc, quant_gguf, f"Finished {q_type}"
+
+                # --- CASE B: SAFETENSORS (convert_to_quant PIP) ---
                 else:
-                    final_name = f"WAN22_{recipe_slug}_{fmt}.safetensors"
-                    final_path = os.path.join(final_dir, final_name)
+                    suffix = fmt.lower().replace(" ", "_")
+                    final_path = temp_path.replace(".safetensors", f"_{suffix}.safetensors")
+                    
+                    # Command Logic (Default is FP8)
                     cmd = ["convert_to_quant", "-i", temp_path, "-o", final_path, "--comfy_quant", "--wan"]
-                    if fmt == "int8": cmd += ["--int8", "--block_size", "128"]
-                    elif fmt == "nvfp4": cmd += ["--nvfp4"]
+                    if "int8" in fmt.lower(): cmd += ["--int8", "--block_size", "128"]
+                    elif "nvfp4" in fmt.lower(): cmd += ["--nvfp4"]
 
-                for update in execute_export_logic(cmd, final_name, final_path, fmt, auto_move, final_dir, log_acc):
-                    if isinstance(update, tuple):
-                        log_acc = update[0]
-                        yield update
-                
-                log_acc += f"✅ Successfully Finished: {final_name}\n"
+                    yield log_acc + f"🚀 Exporting {fmt} via PIP Tool...\n", "", f"Working: {fmt}"
+                    for update in execute_export_logic(cmd, suffix, final_path, fmt, False, MODELS_DIR, log_acc):
+                        if isinstance(update, tuple):
+                            log_acc = update[0]
+                            yield update
+                    
+                    log_acc += f"✅ Finished: {fmt}\n"
 
-            except Exception as item_error:
-                log_acc += f"❌ ERROR in {fmt}: {str(item_error)}\n"
-                log_acc += "⚠️ Skipping to next format in queue...\n"
+            except Exception as e:
+                log_acc += f"❌ ERROR in {fmt}: {str(e)}\n"
                 yield log_acc, "", f"Skipped {fmt}"
-            
             finally:
-                torch.cuda.empty_cache()
                 gc.collect()
+                torch.cuda.empty_cache()
 
-        log_acc += f"\n{'='*60}\n✨ BATCH TASKS FINISHED.\n{'='*60}\n"
+        if bf16_created_path and os.path.exists(bf16_created_path):
+            os.remove(bf16_created_path)
+            log_acc += "🧹 Cleaned up intermediate BF16 GGUF.\n"
+
+        log_acc += f"\n{'='*60}\n✨ ALL BATCH TASKS COMPLETE.\n{'='*60}\n"
+        yield log_acc, temp_path, "Process Finished"
 
     except Exception as e:
         log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
@@ -218,12 +249,24 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
                 refresh_btn = gr.Button("🔄 Refresh Assets", size="sm")
             with gr.Group():
                 q_format = gr.CheckboxGroup(
-                    choices=["None (FP16 Master)", "GGUF_Q4_K_M", "GGUF_Q8_0", "int8", "nvfp4"],
-                    label="Batch Export Formats",
-                    value=["None (FP16 Master)"]
+                    choices=[
+                        "None (FP16 Master)", 
+                        "FP8 (SVD)", 
+                        "INT8 (Block-wise)", 
+                        "NVFP4 (Blackwell)",
+                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q5_K_M", 
+                        "GGUF_Q4_K_M", "GGUF_Q3_K_M", "GGUF_Q2_K"
+                    ],
+                    label="Batch Export: FP8, INT8, NVFP4 & GGUF Q8-Q2",
+                    value=["None (FP16 Master)"],
+                    elem_classes=["quant-selector"]
                 )
             with gr.Row():
-                start_btn = gr.Button("🔥 START", variant="primary", scale=2)
+                run_btn = gr.Button(
+                    "🧩 RUN", 
+                    variant="primary", 
+                    elem_classes=["primary-button"] # This triggers the green gradient in config.py
+                )
                 stop_btn = gr.Button("🛑 STOP", variant="stop", scale=1)
             
             last_path_state = gr.State("")
@@ -240,12 +283,15 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     recipe_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
     base_dd.change(instant_validate, inputs=[recipe_dd, base_dd], outputs=[val_status_display])
     
-    # Logic for Start/Stop
-    run_event = start_btn.click(
-        fn=run_pipeline, 
-        inputs=[recipe_editor, base_dd, quant_select, recipe_dd], # 4 args
-        outputs=[terminal_box, last_path_state, pipeline_status],
-        show_progress="hidden"
+    run_event = run_btn.click(
+        fn=run_pipeline,
+        inputs=[
+            recipe_editor,
+            base_dd,
+            q_format,
+            recipe_dd
+        ],
+        outputs=[terminal_box, last_path_state, pipeline_status]
     )
     
     stop_btn.click(fn=stop_pipeline, outputs=[terminal_box, pipeline_status], cancels=[run_event])
