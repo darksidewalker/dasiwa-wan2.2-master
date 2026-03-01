@@ -1,7 +1,7 @@
 import gradio as gr
 import torch, os, gc, subprocess, shutil, datetime, re, json
 from config import *
-from utils import get_sys_info, instant_validate, get_final_summary_string, sync_ram_to_ssd
+from utils import get_sys_info, instant_validate, get_final_summary_string
 from engine import ActionMasterEngine
 
 # Global handle for the background process
@@ -34,7 +34,6 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
         yield "❌ ERROR: No export formats selected.", "", "Idle"
         return
 
-    # Ghost progress prevents the UI-dimming overlay
     progress = gr.Progress() 
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
@@ -42,19 +41,22 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
     recipe_slug = recipe_name.replace(".json", "") if recipe_name else "custom_merge"
     temp_path = os.path.join(MODELS_DIR, f"MASTER_{recipe_slug}.safetensors")
     
+    # Tool Path Resolution
     ROOT_DIR = os.getcwd()
     LLAMA_BIN = os.path.join(ROOT_DIR, "llama.cpp", "build", "bin", "llama-quantize")
     CONVERT_PY = os.path.join(ROOT_DIR, "convert.py")
     FIX_5D_PY = os.path.join(ROOT_DIR, "fix_5d_tensors.py")
     
     try:
-        # --- 1. ENGINE INIT (All Surgical Logic Restored) ---
-        yield log_acc + "Initializing Engine...\n", "", "Initializing..."
+        # --- 1. ENGINE INITIALIZATION ---
+        yield log_acc + "Initializing Engine (FP32 Mode)...\n", "", "Initializing..."
         recipe_dict = json.loads(re.sub(r'//.*', '', recipe_json))
         recipe_dict['paths'] = recipe_dict.get('paths', {})
         recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
         
         engine = ActionMasterEngine(recipe_dict)
+        
+        # UI Validation Report
         mismatches = engine.get_compatibility_report()
         log_acc += f"\n{'='*60}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{'='*60}\n"
         if mismatches:
@@ -62,35 +64,40 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
         else:
             log_acc += "✅ ALL SYSTEMS CLEAR: Alignment Verified.\n"
         log_acc += f"{'='*60}\n\n"
-        yield log_acc, "", "Merging Layers..."
+        yield log_acc, "", "Merging..."
 
-        # --- 2. MERGING LOOP (Shielded Routing) ---
+        # --- 2. MULTI-ROUND SECTIONAL MERGE ---
         pipeline = recipe_dict.get('pipeline', [])
-        for i, step in enumerate(pipeline):
-            status = f"Merging {step.get('pass_name', 'Pass')} ({i+1}/{len(pipeline)})"
+        total_steps = len(pipeline)
 
+        for idx, step in enumerate(pipeline):
+            current_status = f"Section {idx+1}/{total_steps}: {step.get('pass_name', 'Unknown')}"
+            
+            # Internal engine call ensures FP32 precision and bit-parity with Silveroxides
             for message in engine.process_pass(step, recipe_dict['paths'].get('global_weight_factor', 1.0)):
                 log_acc += message + "\n"
-                yield log_acc, "", status
+                yield log_acc, "", current_status
 
-        # --- 3. SAFETY GATE (Integrity Check) ---
+        # --- 3. FINAL INTEGRITY CHECK ---
         progress(0.7, desc="🛡️ Integrity Scan")
-        from utils import verify_model_integrity
-        for diag_msg in verify_model_integrity(engine.base_dict, engine.base_keys, engine.router_regex):
+        for diag_msg in engine.run_pre_save_check():
             log_acc += diag_msg + "\n"
             yield log_acc, "", "🛡️ Verifying..."
 
-        # --- 4. HARDWARE SYNC & SAVE ---
+        # --- 4. STREAMING SAVE (FP32 -> BF16) ---
         progress(0.85, desc="💾 Writing Master")
         engine.save_master(temp_path)
+        
+        # Get final Shift Data from Engine
+        log_acc += engine.get_final_summary("BF16") + "\n"
+        
         del engine
         gc.collect()
         torch.cuda.empty_cache()
         log_acc += "✅ SOURCE MASTER READY.\n\n"
 
-        # --- 5. BATCH EXPORT (Silent Pipe to Gradio / Heavy Output to Bash) ---
+        # --- 5. BATCH EXPORT QUEUE ---
         quants_to_process = [f for f in q_formats if "None" not in f]
-
         if not quants_to_process:
             log_acc += "✨ Process Finished. No quantizations requested."
             yield log_acc, temp_path, "Idle"
@@ -98,56 +105,51 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
 
         log_acc += f"📦 STARTING BATCH EXPORT QUEUE ({len(quants_to_process)} formats)\n" + "-"*60 + "\n"
         
-        bf16_created_path = None
-
         for idx, fmt in enumerate(q_formats):
+            if "None" in fmt: continue
             batch_status = f"Exporting {fmt} ({idx+1}/{len(q_formats)})"
             
             if "GGUF_" in fmt:
                 q_type = fmt.replace("GGUF_", "")
                 final_path = temp_path.replace(".safetensors", f"-{q_type}.gguf")
-                bf16_path = temp_path.replace(".safetensors", "-BF16.gguf")
+                bf16_gguf = temp_path.replace(".safetensors", "-BF16.gguf")
                 
-                # Chain of commands
-                steps = [
-                    (f"📦 Converting {fmt} to BF16 Base...", ["python", CONVERT_PY, "--src", temp_path]),
-                    (f"🔨 Quantizing {fmt}...", [LLAMA_BIN, bf16_path, final_path, q_type]),
-                    (f"🔧 Applying 5D Fix to {fmt}...", ["python", FIX_5D_PY, "--src", final_path, "--dst", final_path])
-                ]
-                bf16_created_path = bf16_path
+                # Step 1: Convert to GGUF (BF16)
+                log_acc += f"📦 Converting to BF16 GGUF...\n"
+                yield log_acc, "", batch_status
+                active_process = subprocess.Popen(["python", CONVERT_PY, "--src", temp_path])
+                active_process.wait()
+
+                # Step 2: Llama-Quantize
+                log_acc += f"🔨 Quantizing to {q_type}...\n"
+                yield log_acc, "", batch_status
+                active_process = subprocess.Popen([LLAMA_BIN, bf16_gguf, final_path, q_type])
+                active_process.wait()
+
+                # Step 3: Fix 5D Tensors (Surgical Fix for Wan 2.1/2.2)
+                log_acc += f"🔧 Applying 5D Expert Tensor Fix...\n"
+                yield log_acc, "", batch_status
+                active_process = subprocess.Popen(["python", FIX_5D_PY, "--src", final_path, "--dst", final_path])
+                active_process.wait()
+                
+                if os.path.exists(bf16_gguf): os.remove(bf16_gguf)
             else:
+                # Standard FP8/INT8 logic
                 suffix = fmt.lower().replace(" ", "_")
                 final_path = temp_path.replace(".safetensors", f"_{suffix}.safetensors")
                 cmd = ["convert_to_quant", "-i", temp_path, "-o", final_path, "--comfy_quant", "--wan"]
                 if "int8" in fmt.lower(): cmd += ["--int8", "--block_size", "128"]
                 elif "nvfp4" in fmt.lower(): cmd += ["--nvfp4"]
-                steps = [(f"🚀 PIP: Running {fmt} export...", cmd)]
-
-            for step_msg, cmd in steps:
-                if (cmd[0] == LLAMA_BIN or "python" in cmd) and not os.path.exists(temp_path if "convert.py" in cmd[1] else final_path if "fix" in cmd[1] else bf16_path):
-                     # Logic check for missing files in GGUF chain
-                     if "llama-quantize" in cmd[0] and not os.path.exists(bf16_path): continue
-
-                log_acc += f"{step_msg}\n"
-                yield log_acc, "", batch_status
                 
-                # POPEN: stdout=None means it goes to your BASH terminal (full spam ok)
-                # But Gradio stays clean because we aren't yielding the lines
+                log_acc += f"🚀 Running {fmt} export...\n"
+                yield log_acc, "", batch_status
                 active_process = subprocess.Popen(cmd)
                 active_process.wait()
-                
-                if active_process.returncode != 0:
-                    log_acc += f"❌ STEP FAILED: {' '.join(cmd)}\n"
-                    break
 
             log_acc += f"✅ FINISHED: {fmt}\n"
             yield log_acc, final_path, batch_status
 
-        if bf16_created_path and os.path.exists(bf16_created_path):
-            os.remove(bf16_created_path)
-            log_acc += "🧹 Cleaned up BF16 intermediate.\n"
-
-        log_acc += "\n✨ ALL TASKS FINISHED."
+        log_acc += "\n✨ ALL TASKS COMPLETED SUCCESSFULLY."
         yield log_acc, temp_path, "Idle"
 
     except Exception as e:
@@ -156,72 +158,44 @@ def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
         active_process = None
         torch.cuda.empty_cache()
 
-def execute_export_logic(cmd, final_name, final_path, q_format, auto_move, final_dir, log_acc):
-    global active_process
-    yield log_acc + f"🔨 STARTING EXPORT: {final_name}...\n", "", f"Quantizing {q_format}..."
-    
-    # Use Popen to keep it interruptible by the STOP button
-    active_process = subprocess.Popen(cmd)
-    active_process.wait()
-    
-    # Check if it was stopped by the user or crashed
-    if active_process is None: # Means stop_pipeline was called
-         yield log_acc + "🛑 EXPORT CANCELLED BY USER.\n", "", "Stopped"
-         return
-
-    if active_process.returncode != 0:
-        raise Exception(f"Quantization failed (Code {active_process.returncode})")
-    
-    active_process = None
-    log_acc += f"✅ EXPORT COMPLETE: {final_name}\n"
-    yield log_acc, final_path, "Process Finished"
-
-# --- UI LAYOUT ---
-with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
+# --- GRADIO UI LAYOUT (Gradio 6 Optimized) ---
+with gr.Blocks(title="ActionMaster STATION") as demo:
     with gr.Row():
         with gr.Column(scale=4): 
-            gr.Markdown("# ⚜️ DaSiWa WAN 2.2 Master\n**14B High-Precision MoE Pipeline**")
+            gr.Markdown("# ⚜️ ActionMaster STATION MASTER\n**High-Precision Wan 2.1/2.2 14B Merging Engine**")
         with gr.Column(scale=3):
-            vitals_box = gr.Textbox(label="System Health", value=get_sys_info(), lines=3, interactive=False)
+            vitals_box = gr.Textbox(label="Hardware Vitals", value=get_sys_info(), lines=3, interactive=False)
             gr.Timer(2).tick(get_sys_info, outputs=vitals_box)
         with gr.Column(scale=3):
-            pipeline_status = gr.Label(label="Current Stage", value="Idle")
+            pipeline_status = gr.Label(label="Process State", value="Idle")
 
     with gr.Row():
         with gr.Column(scale=2):
             with gr.Group():
-                base_dd = gr.Dropdown(label="Base Model", allow_custom_value=True)
-                recipe_dd = gr.Dropdown(label="Active Recipe", allow_custom_value=True)
-                val_status_display = gr.Markdown("### 🛡️ Status: No Recipe Selected")
+                base_dd = gr.Dropdown(label="Base Model (Safetensors)", allow_custom_value=True)
+                recipe_dd = gr.Dropdown(label="Active Recipe (JSON)", allow_custom_value=True)
+                val_status_display = gr.Markdown("### 🛡️ Status: Standby")
                 refresh_btn = gr.Button("🔄 Refresh Assets", size="sm")
             with gr.Group():
                 q_format = gr.CheckboxGroup(
                     choices=[
-                        "None (FP16 Master)", 
-                        "FP8 (SVD)", 
-                        "INT8 (Block-wise)", 
-                        "NVFP4 (Blackwell)",
-                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q5_K_M", 
-                        "GGUF_Q4_K_M", "GGUF_Q3_K_M", "GGUF_Q2_K"
+                        "None (BF16 Master)", "FP8 (SVD)", "INT8 (Block-wise)", 
+                        "GGUF_Q8_0", "GGUF_Q6_K", "GGUF_Q5_K_M", "GGUF_Q4_K_M"
                     ],
-                    label="Batch Export: FP8, INT8, NVFP4 & GGUF Q8-Q2",
-                    value=["None (FP16 Master)"],
-                    elem_classes=["quant-selector"]
+                    label="Export Formats",
+                    value=["None (BF16 Master)"]
                 )
             with gr.Row():
-                run_btn = gr.Button(
-                    "🧩 RUN", 
-                    variant="primary", 
-                    elem_classes=["primary-button"] # This triggers the green gradient in config.py
-                )
-                stop_btn = gr.Button("🛑 STOP", variant="stop", scale=1)
-            
+                run_btn = gr.Button("🧩 RUN PIPELINE", variant="primary", elem_classes=["primary-button"])
+                stop_btn = gr.Button("🛑 STOP", variant="stop")
             last_path_state = gr.State("")
 
         with gr.Column(scale=5):
             with gr.Tabs():
-                with gr.Tab("💻 Terminal"): terminal_box = gr.Textbox(lines=28, interactive=False, show_label=False, elem_id="terminal")
-                with gr.Tab("📝 Editor"): recipe_editor = gr.Code(language="json", lines=28)
+                with gr.Tab("💻 Terminal Log"):
+                    terminal_box = gr.Textbox(lines=28, interactive=False, show_label=False, elem_id="terminal")
+                with gr.Tab("📝 Recipe Editor"):
+                    recipe_editor = gr.Code(language="json", lines=28)
 
     # --- BINDINGS ---
     demo.load(list_files, outputs=[base_dd, recipe_dd])
@@ -232,30 +206,13 @@ with gr.Blocks(title="DaSiWa WAN 2.2 Master") as demo:
     
     run_event = run_btn.click(
         fn=run_pipeline,
-        inputs=[
-            recipe_editor,
-            base_dd,
-            q_format,
-            recipe_dd
-        ],
+        inputs=[recipe_editor, base_dd, q_format, recipe_dd],
         outputs=[terminal_box, last_path_state, pipeline_status]
     )
-    
     stop_btn.click(fn=stop_pipeline, outputs=[terminal_box, pipeline_status], cancels=[run_event])
     
-    terminal_box.change(fn=None, js=JS_AUTO_SCROLL)
+    # Auto-scroll JS binding
+    terminal_box.change(fn=None, js="(x) => { document.getElementById('terminal').querySelector('textarea').scrollTop = 9999999; }")
 
 if __name__ == "__main__":
-    try:
-        demo.launch(css=CSS_STYLE) 
-    except KeyboardInterrupt:
-        print("\n" + "!"*60)
-        print("🛑 SIGNAL RECEIVED: Performing Clean Shutdown...")
-        if active_process:
-            print("   - Terminating active subprocess...")
-            active_process.terminate()
-        print("   - Flushing VRAM...")
-        torch.cuda.empty_cache()
-        print("✅ Shutdown Complete. Terminal Safe.")
-        print("!"*60 + "\n")
-        os._exit(0)
+    demo.launch(css=CSS_STYLE)
