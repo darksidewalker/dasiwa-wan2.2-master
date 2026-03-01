@@ -88,54 +88,78 @@ class ActionMasterEngine:
         return sum(mags) / len(mags) if mags else 0
 
     def find_lora_keys(self, lora_sd, target_key):
-        clean_target = target_key.replace("diffusion_model.", "").replace(".weight", "")
-        underscore_target = clean_target.replace(".", "_")
-        pairs = [(".lora_B", ".lora_A"), (".lora_up", ".lora_down"), ("_lora_up", "_lora_down"), (".lora_up.weight", ".lora_down.weight"), ("_lora_B", "_lora_A")]
+        import re
+        # target: "blocks.0.ffn.0.weight"
+        t_clean = target_key.replace("diffusion_model.", "").replace(".weight", "")
+        # 🛡️ INDEX EXTRACTION: Finds all numbers (e.g., [0, 0])
+        t_indices = re.findall(r'\d+', t_clean)
+        t_norm = t_clean.replace(".", "_")
+
+        # The pairs found in your report (B is usually the 'Up' matrix in these)
+        pairs = [
+            (".lora_B.weight", ".lora_A.weight"),
+            (".lora_B", ".lora_A"),
+            (".lora_up.weight", ".lora_down.weight"),
+            (".lora_up", ".lora_down")
+        ]
+
         for k in lora_sd.keys():
-            if clean_target in k or underscore_target in k:
-                for up_suf, down_suf in pairs:
-                    if up_suf in k:
-                        up_k, down_k = k, k.replace(up_suf, down_suf)
-                        if down_k in lora_sd: return up_k, down_k, "matrix"
-        if not len(self.base_dict[target_key].shape) == 2:
-            for k in lora_sd.keys():
-                if clean_target in k or underscore_target in k:
-                    if any(x in k for x in [".diff", ".alpha", ".bias", "_alpha", "_bias"]): return k, None, "vector"
+            # 🛡️ STRICT NUMBER CHECK:
+            # If the LoRA key has different numbers than the target, skip it!
+            if t_indices != re.findall(r'\d+', k):
+                continue
+
+            for up_suf, down_suf in pairs:
+                if up_suf in k:
+                    # Normalize LoRA stem (remove prefixes/separators)
+                    l_stem = k.replace(up_suf, "").replace(".", "_").replace("__", "_")
+                    if "lora_unet_" in l_stem: l_stem = l_stem.replace("lora_unet_", "")
+                    
+                    # TAIL MATCH: Allows "blocks_0_ffn_0" to match "diffusion_model_blocks_0_ffn_0"
+                    if t_norm.endswith(l_stem) or l_stem.endswith(t_norm):
+                        down_k = k.replace(up_suf, down_suf)
+                        if down_k in lora_sd:
+                            return k, down_k, "matrix"
+                            
         return None, None, None
 
     def calculate_delta(self, lora_sd, up_k, down_k, weight, global_mult, target_key, method, recipe_density):
-        # 🛡️ ROUTER SHIELD: Protect MoE Gates
-        if self.router_regex.search(target_key):
-            return None, 0.0, False
-
         with torch.no_grad():
-            # Speed up with Pinned Memory -> CUDA
-            up = lora_sd[up_k].to(torch.float32).pin_memory().to("cuda", non_blocking=True)
-            down = lora_sd[down_k].to(torch.float32).pin_memory().to("cuda", non_blocking=True)
+            # Move to CUDA for the actual math
+            up = lora_sd[up_k].to("cuda", dtype=torch.float32)
+            down = lora_sd[down_k].to("cuda", dtype=torch.float32)
             
-            # Base Delta
+            # 🛡️ AUTOMATIC RANK ALIGNMENT
+            # Some LoRAs are [5120, 32], others are [32, 5120]. 
+            # We ensure (Up @ Down) results in the shape the Base Model expects.
+            if up.shape[1] != down.shape[0]:
+                if up.shape[1] == down.shape[1]:
+                    down = down.T
+                elif up.shape[0] == down.shape[0]:
+                    up = up.T
+
+            # Calculate Delta
             delta = (up @ down) * (float(weight) * global_mult)
 
-            # --- LOGIC BRANCHING ---
-            if method == "INJECTION" and recipe_density < 1.0:
-                # 🧠 SURGICAL DARE: Drop and Rescale
-                # Works with different LoRA ranks where TIES fails
-                flat_delta = delta.flatten()
-                # Determine how many weights to "Drop" (1 - density)
-                k = int(flat_delta.numel() * (1.0 - recipe_density))
-                if k > 0:
-                    threshold = torch.topk(flat_delta.abs(), k, largest=False).values[-1]
-                    mask = delta.abs() > threshold
-                    # Rescale by 1/p to conserve total energy
+            # DUAL MODE: Addition vs Injection
+            if method.upper() == "INJECTION" and recipe_density < 1.0:
+                flat = delta.flatten()
+                k_drop = int(flat.numel() * (1.0 - recipe_density))
+                if k_drop > 0:
+                    thresh = torch.topk(flat.abs(), k_drop, largest=False).values[-1]
+                    mask = delta.abs() > thresh
                     delta = torch.where(mask, delta / recipe_density, torch.zeros_like(delta))
-                passed_pct = recipe_density * 100
+                kept_pct = recipe_density * 100
             else:
-                # ⚗️ ADDITION: Pure Distillation (Ignore Density)
-                passed_pct = 100.0
+                # Standard Addition (100% weight, ignores density)
+                kept_pct = 100.0
 
-            return delta.to("cpu"), passed_pct, True
+            return delta.to("cpu"), kept_pct, True
 
     def apply_delta(self, target_key, delta):
+        """
+        Applies delta to base model with 5D MoE support and Norm-Preservation.
+        """
         if delta is None: return False
         base = self.base_dict[target_key]
         
@@ -143,39 +167,21 @@ class ActionMasterEngine:
             cpu_delta = delta.to(torch.float32)
             base_f32 = base.to(torch.float32)
             
-            # --- 🛡️ 5D TENSOR RECONCILIATION ---
-            # Wan 2.2 14B often uses [1, 1, 8, 5120, 5120] or similar for experts.
+            # 🛡️ 5D TENSOR RECONCILIATION (For MoE Experts)
+            # Reshapes 2D LoRA [H, W] to match 5D Expert [1, 1, 8, H, W]
             if base_f32.ndim == 5 and cpu_delta.ndim <= 2:
-                # Calculate the missing "Expert/Head" multiplier
-                # If base is [1, 1, 8, 5120, 5120] and delta is [5120, 5120]
-                # we need to view delta as [1, 1, 1, 5120, 5120] so it broadcasts.
-                try:
-                    # Match the trailing dimensions (the actual weight matrix)
-                    d_h, d_w = cpu_delta.shape[-2], cpu_delta.shape[-1]
-                    view_shape = list(base_f32.shape)
-                    for i in range(len(view_shape) - 2):
-                        view_shape[i] = 1 # Collapse leading dims for broadcasting
-                    
-                    cpu_delta = cpu_delta.view(view_shape)
-                except Exception:
-                    # If shapes are fundamentally incompatible (e.g., 2 vs 5120), skip it
-                    return False
+                view_shape = [1] * (base_f32.ndim - 2) + list(cpu_delta.shape)
+                cpu_delta = cpu_delta.view(view_shape)
 
-            # --- STRUCTURAL VALIDATION (Standard) ---
-            if cpu_delta.numel() == base_f32.numel():
-                cpu_delta = cpu_delta.reshape(base_f32.shape)
-            
-            # --- THE "VIDEO KILL" CURE: Norm Preservation ---
+            # --- THE "VIDEO KILL" CURE: NORM PRESERVATION ---
+            # Measure original activation energy (vital for Routers/Gates)
             orig_norm = torch.norm(base_f32)
             
-            try:
-                # The actual addition (now supports 5D broadcasting)
-                updated_weight = base_f32 + cpu_delta
-            except RuntimeError as e:
-                # Final safety: If it still fails, the LoRA is targeting a mismatched sub-layer
-                return False
+            # Apply the update
+            updated_weight = base_f32 + cpu_delta
             
-            # Re-scale to preserve MoE Router calibration
+            # Re-scale back to Original Norm 
+            # This keeps the MoE Routers perfectly calibrated
             new_norm = torch.norm(updated_weight)
             if new_norm > 0:
                 updated_weight = updated_weight * (orig_norm / new_norm)
@@ -190,7 +196,8 @@ class ActionMasterEngine:
 
     def process_pass(self, step, global_mult):
         """
-        Executes a 14B Merge Pass with GPU-Acceleration and Router Shielding.
+        Executes a 14B Merge Pass. 
+        Unshielded: Now merges into Routers and Experts alike.
         Optimized for 64GB RAM / MoE Architecture.
         """
         method_label = str(step.get('method', 'ADDITION')).upper()
@@ -201,11 +208,12 @@ class ActionMasterEngine:
         
         # Calculate baseline for Global Shift tracking
         pre_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
-        pass_stats, total_inj, pass_peaks = {"matrix": 0, "vector": 0, "dense": 0, "skipped": 0}, [], 0
+        pass_stats, total_inj, pass_peaks = {"matrix": 0, "vector": 0, "dense": 0}, [], 0
         
         for f in features:
+            from config import get_ram_threshold_met # Ensure import is available
             if get_ram_threshold_met():
-                yield f"  ⚠️ SYSTEM OVERHEAD CRITICAL: Low-RAM Mode (zSwap Active) for {f['file']}..." 
+                yield f"  ⚠️ SYSTEM OVERHEAD CRITICAL: Low-RAM Mode (zSwap Active) for {f['file']}..."
             
             lora_path = os.path.join(lora_dir, f['file'])
             if not os.path.exists(lora_path): 
@@ -214,91 +222,84 @@ class ActionMasterEngine:
             
             yield f"  🧬 Analyzing: {f['file']}..."
             
-            # Load LoRA to CPU first, then we'll pin/move specific tensors in calculate_delta
+            # Load LoRA to CPU first
             lora_sd = load_file(lora_path)
             
             for target_key in self.base_keys:
                 k1, k2, k_type = self.find_lora_keys(lora_sd, target_key)
                 dk = target_key if target_key in lora_sd else None
                 
+                # --- UNSHIELDED MERGE LOGIC ---
+                # We removed the 'if not self.router_regex.search(target_key)' blocks
                 match (k_type, dk):
                     case ("matrix", _):
-                        delta, inj_val, hit = self.calculate_delta(
-                        lora_sd, k1, k2, f['weight'], global_mult, 
-                        target_key, method_label, recipe_density
-                    )
+                        # calculate_delta handles the Addition vs Injection logic internally
+                        delta, inj_val, _ = self.calculate_delta(
+                            lora_sd, k1, k2, f['weight'], global_mult, 
+                            target_key, method_label, recipe_density
+                        )
                         
-                        # 2. APPLY ONLY IF NOT SHIELDED
-                        if hit:
-                            if self.apply_delta(target_key, delta):
-                                pass_stats["matrix"] += 1
-                                total_inj.append(inj_val)
-                                if inj_val > 0: pass_peaks += 1
-                        else:
-                            pass_stats["skipped"] += 1
+                        # apply_delta handles 5D broadcasting and Norm-Preservation
+                        if self.apply_delta(target_key, delta):
+                            pass_stats["matrix"] += 1
+                            total_inj.append(inj_val)
+                            if inj_val > 0: pass_peaks += 1
                     
                     case ("vector", _):
-                        # Vectors are small enough to do on CPU, but we still shield them
-                        if not self.router_regex.search(target_key):
-                            delta = (lora_sd[k1].to(torch.float32) * float(f['weight']) * global_mult).cpu()
-                            if self.apply_delta(target_key, delta):
-                                pass_stats["vector"] += 1
+                        delta = (lora_sd[k1].to(torch.float32) * float(f['weight']) * global_mult).cpu()
+                        if self.apply_delta(target_key, delta):
+                            pass_stats["vector"] += 1
                     
                     case (_, str(dense_key)):
-                        if not self.router_regex.search(target_key):
-                            delta = (lora_sd[dense_key].to(torch.float32) * float(f['weight']) * global_mult).cpu()
-                            if self.apply_delta(target_key, delta):
-                                pass_stats["dense"] += 1
-                                total_inj.append(100.0)
+                        delta = (lora_sd[dense_key].to(torch.float32) * float(f['weight']) * global_mult).cpu()
+                        if self.apply_delta(target_key, delta):
+                            pass_stats["dense"] += 1
+                            total_inj.append(100.0)
 
-            # Cleanup current LoRA before moving to the next feature
+            # Cleanup current LoRA
             del lora_sd
             self._cleanup()
 
             # 3. KNOWLEDGE HEALTH CALCULATION
             current_val = (sum(total_inj) / len(total_inj)) if total_inj else 100.0
-            
-            # Calibration for 14B MoE: "Thin" is expected at low densities
             health_status = "STABLE" if current_val > 5.0 else "THIN"
             if pass_peaks > 15000: health_status = "VOLATILE" 
 
             yield f"    └─ [{method_label}] Knowledge Kept: {current_val:.1f}% | Health: {health_status}"
 
-        # 4. INTERNAL NORMALIZATION (Handles doubling internally)
+        # 4. INTERNAL NORMALIZATION
         if step.get('normalize', False):
-            # The generator yields messages directly to the UI
             for norm_msg in self.soft_normalize():
                 yield norm_msg
 
-        # 5. FINAL PASS SUMMARY & SHIFT
+        # 5. FINAL PASS SUMMARY
         post_mean = sum(v.abs().mean().item() for v in self.base_dict.values()) / len(self.base_dict)
         shift = abs(post_mean - pre_mean)
+        
+        # Count total successful applications
+        total_layers = pass_stats["matrix"] + pass_stats["vector"] + pass_stats["dense"]
         
         self.summary_data.append({
             "pass": pass_name, 
             "method": method_label, 
-            "layers": sum(v for k,v in pass_stats.items() if k != "skipped"), 
+            "layers": total_layers, 
             "kept": current_val, 
             "peaks": pass_peaks, 
             "delta": shift
         })
         
-        yield f"  ✅ {pass_name} Complete. Global Shift: {shift:.8f}"
+        # This is the line that shows you if the engine is actually working
+        yield f"  ✅ {pass_name} Complete. Layers Matched: {total_layers} | Global Shift: {shift:.8f}"
 
-    def get_final_summary_string(self):
-        lines = ["\n" + "="*85, f"📊 FINAL MERGE SUMMARY: {self.role_label}", "="*85]
-        lines.append(f"{'PASS NAME':<15} | {'METHOD':<10} | {'LAYERS':<8} | {'KNOWLEDGE %':<12} | {'PEAKS':<6} | {'SHIFT'}")
-        lines.append("-" * 85)
-        total_delta = 0
-        for s in self.summary_data:
-            lines.append(f"{s['pass']:<15} | {s['method']:<10} | {s['layers']:<8} | {s['inj']:>10.1f}% | {s['peaks']:<6} | {s['delta']:.8f}")
-            total_delta += s['delta']
-        lines.append("-" * 85)
-        # Your engine.py version has three tiers of stability
-        status = "STABLE" if total_delta < 0.015 else ("SATURATED" if total_delta < 0.030 else "VOLATILE")
-        lines.append(f"{'TOTAL MODEL SHIFT':<52} | {total_delta:.8f}")
-        lines.append(f"{'STABILITY CHECK':<52} | {status}")
-        lines.append("="*85 + "\n")
+    def get_final_summary_string(summary_list):
+        if not summary_list: return "No data."
+        header = f"{'PASS NAME':<15} | {'METHOD':<10} | {'LAYERS':<8} | {'KEPT %':>8} | {'PEAKS':<6} | {'SHIFT'}"
+        lines = [header, "-" * len(header)]
+        
+        for s in summary_list:
+            # Use 'kept' to match our refactored dictionary
+            lines.append(f"{s['pass']:<15} | {s['method']:<10} | {s['layers']:<8} | {s['kept']:>8.1f}% | {s['peaks']:<6} | {s['delta']:.8f}")
+        
         return "\n".join(lines)
 
     def get_metadata_string(self, quant="None"):

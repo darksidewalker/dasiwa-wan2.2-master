@@ -6,6 +6,7 @@ models
 !recipes/example.json
 logs/
 session_recipe.json
+model_structure_report.txt
 
 # --- Custom Build / Llama.cpp ---
 llama.cpp/
