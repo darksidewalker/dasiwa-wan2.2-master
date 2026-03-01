@@ -24,159 +24,128 @@ def load_recipe_text(name):
 def stop_pipeline():
     global active_process
     if active_process:
-        print("🛑 STOP SIGNAL: Terminating subprocess...")
-        active_process.terminate()
+        active_process.kill() 
         active_process = None
     torch.cuda.empty_cache()
     gc.collect()
-    return "🛑 PROCESS TERMINATED BY USER\n" + "-"*60, "Idle"
+    return "🛑 BASH PROCESS TERMINATED\n" + "-"*60, "Idle"
 
 def run_pipeline(recipe_json, base_model, q_formats, recipe_name):
-    # --- 0. PRE-FLIGHT ---
+    global active_process
     if not q_formats:
         yield "❌ ERROR: No export formats selected.", "", "Idle"
         return
 
-    # Fix: Define a 'ghost' progress to prevent NameErrors without triggering the UI overlay
-    # This allows your existing logic to remain exactly as written.
+    # Ghost progress prevents the UI-dimming overlay
     progress = gr.Progress(track_tensors=False) 
-
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     log_acc = f"[{timestamp}] ⚜️ DaSiWa STATION MASTER ACTIVE\n" + "="*60 + "\n"
-    global active_process
     
     recipe_slug = recipe_name.replace(".json", "") if recipe_name else "custom_merge"
-    cache_name = f"MASTER_{recipe_slug}.safetensors"
-    temp_path = os.path.join(MODELS_DIR, cache_name)
+    temp_path = os.path.join(MODELS_DIR, f"MASTER_{recipe_slug}.safetensors")
     
     ROOT_DIR = os.getcwd()
     LLAMA_BIN = os.path.join(ROOT_DIR, "llama.cpp", "build", "bin", "llama-quantize")
     CONVERT_PY = os.path.join(ROOT_DIR, "convert.py")
     FIX_5D_PY = os.path.join(ROOT_DIR, "fix_5d_tensors.py")
     
-    master_exists = os.path.exists(temp_path) and os.path.getsize(temp_path) > 1e9
-    skip_merge = master_exists and not (len(q_formats) == 1 and "None (FP16 Master)" in q_formats)
-    
     try:
-        if skip_merge:
-            log_acc += f"⚡ FAST TRACK: Found existing Master: {cache_name}\n"
-            yield log_acc, "", "Fast Tracking..."
+        # --- 1. ENGINE INIT (All Surgical Logic Restored) ---
+        yield log_acc + "Initializing Engine...\n", "", "Initializing..."
+        recipe_dict = json.loads(re.sub(r'//.*', '', recipe_json))
+        recipe_dict['paths'] = recipe_dict.get('paths', {})
+        recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
+        
+        engine = ActionMasterEngine(recipe_dict)
+        mismatches = engine.get_compatibility_report()
+        log_acc += f"\n{'='*60}\n🛡️  RECIPE VALIDATION: {engine.role_label}\n{'='*60}\n"
+        if mismatches:
+            for m in mismatches: log_acc += f"   - [WARN] {m}\n"
         else:
-            # --- 1. ENGINE INIT ---
-            yield log_acc + "Initializing Engine...\n", "", "Initializing..."
-            clean_json = re.sub(r'//.*', '', recipe_json)
-            recipe_dict = json.loads(clean_json)
-            recipe_dict['paths'] = recipe_dict.get('paths', {})
-            recipe_dict['paths']['base_model'] = os.path.join(MODELS_DIR, base_model)
-            
-            engine = ActionMasterEngine(recipe_dict)
-            log_acc += f"🛡️  RECIPE VALIDATION: {engine.role_label}\n"
-            yield log_acc, "", "Merging Layers..."
+            log_acc += "✅ ALL SYSTEMS CLEAR: Alignment Verified.\n"
+        log_acc += f"{'='*60}\n\n"
+        yield log_acc, "", "Merging Layers..."
 
-            # --- 2. MERGING LOOP ---
-            pipeline = recipe_dict.get('pipeline', [])
-            global_mult = recipe_dict['paths'].get('global_weight_factor', 1.0)
+        # --- 2. MERGING LOOP (Shielded Routing) ---
+        pipeline = recipe_dict.get('pipeline', [])
+        for i, step in enumerate(pipeline):
+            status = f"Merging {step.get('pass_name', 'Pass')} ({i+1}/{len(pipeline)})"
+            for message in engine.process_pass(step, recipe_dict['paths'].get('global_weight_factor', 1.0)):
+                log_acc += message + "\n"
+                yield log_acc, "", status
 
-            for i, step in enumerate(pipeline):
-                p_name = step.get('pass_name', f"Pass {i+1}")
-                status = f"Merging {p_name} ({i+1}/{len(pipeline)})"
-                for message in engine.process_pass(step, global_mult):
-                    log_acc += message + "\n"
-                    yield log_acc, "", status
+        # --- 3. SAFETY GATE (Integrity Check) ---
+        progress(0.7, desc="🛡️ Integrity Scan")
+        from utils import verify_model_integrity
+        for diag_msg in verify_model_integrity(engine.base_dict, engine.base_keys, engine.router_regex):
+            log_acc += diag_msg + "\n"
+            yield log_acc, "", "🛡️ Verifying..."
 
-            # --- 3. THE SAFETY GATE ---
-            # Using progress here updates the backend without forcing the CLI overlay
-            progress(0.7, desc="🛡️ Integrity Scan") 
-            log_acc += "\n" + "="*60 + "\n"
-            from utils import verify_model_integrity
-            
-            try:
-                for diag_msg in verify_model_integrity(engine.base_dict, engine.base_keys, engine.router_regex):
-                    log_acc += diag_msg + "\n"
-                    yield log_acc, "", "🛡️ Verifying..."
-            except Exception as e:
-                log_acc += f"\n🔥 INTEGRITY FAILURE: {str(e)}\n"
-                yield log_acc, "", "Failed"
-                return 
+        # --- 4. HARDWARE SYNC & SAVE ---
+        progress(0.85, desc="💾 Writing Master")
+        engine.save_master(temp_path)
+        del engine
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_acc += "✅ SOURCE MASTER READY.\n\n"
 
-            # --- 4. HARDWARE SYNC & SAVE ---
-            progress(0.85, desc="💾 Writing Master")
-            log_acc += f"💾 EXPORT: Writing Source Master to SSD...\n"
-            yield log_acc, "", "💾 WRITING MASTER..." 
-            engine.save_master(temp_path) 
-            
-            del engine
-            gc.collect()
-            torch.cuda.empty_cache()
-            log_acc += f"✅ SOURCE MASTER READY.\n\n"
-
-        # --- 5. BATCH EXPORT QUEUE ---
+        # --- 5. BATCH EXPORT (Silent Pipe to Gradio / Heavy Output to Bash) ---
         log_acc += "📦 STARTING BATCH EXPORT QUEUE\n" + "-"*60 + "\n"
         bf16_created_path = None
 
         for idx, fmt in enumerate(q_formats):
-            # Combined status for both Terminal and the Status Label
             batch_status = f"Exporting {fmt} ({idx+1}/{len(q_formats)})"
             
-            try:
-                if fmt == "None (FP16 Master)":
-                    log_acc += "🔹 FP16 Master: Ready.\n"
-                    yield log_acc, temp_path, "FP16 Ready"
-                    continue
+            if "GGUF_" in fmt:
+                q_type = fmt.replace("GGUF_", "")
+                final_path = temp_path.replace(".safetensors", f"-{q_type}.gguf")
+                bf16_path = temp_path.replace(".safetensors", "-BF16.gguf")
+                
+                # Chain of commands
+                steps = [
+                    (f"📦 Converting {fmt} to BF16 Base...", ["python", CONVERT_PY, "--src", temp_path]),
+                    (f"🔨 Quantizing {fmt}...", [LLAMA_BIN, bf16_path, final_path, q_type]),
+                    (f"🔧 Applying 5D Fix to {fmt}...", ["python", FIX_5D_PY, "--src", final_path, "--dst", final_path])
+                ]
+                bf16_created_path = bf16_path
+            else:
+                suffix = fmt.lower().replace(" ", "_")
+                final_path = temp_path.replace(".safetensors", f"_{suffix}.safetensors")
+                cmd = ["convert_to_quant", "-i", temp_path, "-o", final_path, "--comfy_quant", "--wan"]
+                if "int8" in fmt.lower(): cmd += ["--int8", "--block_size", "128"]
+                elif "nvfp4" in fmt.lower(): cmd += ["--nvfp4"]
+                steps = [(f"🚀 PIP: Running {fmt} export...", cmd)]
 
-                if "GGUF_" in fmt:
-                    q_type = fmt.replace("GGUF_", "")
-                    bf16_gguf = temp_path.replace(".safetensors", "-BF16.gguf")
-                    quant_gguf = temp_path.replace(".safetensors", f"-{q_type}.gguf")
+            for step_msg, cmd in steps:
+                if (cmd[0] == LLAMA_BIN or "python" in cmd) and not os.path.exists(temp_path if "convert.py" in cmd[1] else final_path if "fix" in cmd[1] else bf16_path):
+                     # Logic check for missing files in GGUF chain
+                     if "llama-quantize" in cmd[0] and not os.path.exists(bf16_path): continue
 
-                    if not os.path.exists(bf16_gguf):
-                        log_acc += f"📦 GGUF {q_type}: Converting to BF16...\n"
-                        yield log_acc, "", batch_status
-                        # Capture output prevents the CLI flicker
-                        subprocess.run(["python", CONVERT_PY, "--src", temp_path], check=True, capture_output=True)
-                        bf16_created_path = bf16_gguf
+                log_acc += f"{step_msg}\n"
+                yield log_acc, "", batch_status
+                
+                # POPEN: stdout=None means it goes to your BASH terminal (full spam ok)
+                # But Gradio stays clean because we aren't yielding the lines
+                active_process = subprocess.Popen(cmd)
+                active_process.wait()
+                
+                if active_process.returncode != 0:
+                    log_acc += f"❌ STEP FAILED: {' '.join(cmd)}\n"
+                    break
 
-                    log_acc += f"🔨 GGUF {q_type}: Quantizing...\n"
-                    yield log_acc, "", batch_status
-                    subprocess.run([LLAMA_BIN, bf16_gguf, quant_gguf, q_type], check=True, capture_output=True)
-
-                    log_acc += f"🔧 GGUF {q_type}: Applying 5D Fix...\n"
-                    yield log_acc, "", batch_status
-                    subprocess.run(["python", FIX_5D_PY, "--src", quant_gguf, "--dst", quant_gguf], check=True, capture_output=True)
-                    
-                    log_acc += f"✅ SUCCESS: {os.path.basename(quant_gguf)}\n"
-                    yield log_acc, quant_gguf, batch_status
-
-                else:
-                    suffix = fmt.lower().replace(" ", "_").replace("(", "").replace(")", "")
-                    final_path = temp_path.replace(".safetensors", f"_{suffix}.safetensors")
-                    cmd = ["convert_to_quant", "-i", temp_path, "-o", final_path, "--comfy_quant", "--wan"]
-                    if "int8" in fmt.lower(): cmd += ["--int8", "--block_size", "128"]
-                    elif "nvfp4" in fmt.lower(): cmd += ["--nvfp4"]
-
-                    log_acc += f"🚀 PIP: Running {fmt} export...\n"
-                    yield log_acc, "", batch_status
-                    subprocess.run(cmd, check=True, capture_output=True)
-                    
-                    log_acc += f"✅ SUCCESS: {os.path.basename(final_path)}\n"
-                    yield log_acc, final_path, batch_status
-
-            except Exception as e:
-                log_acc += f"❌ ERROR in {fmt}: {str(e)}\n"
-                yield log_acc, "", "Skipped"
+            log_acc += f"✅ FINISHED: {fmt}\n"
+            yield log_acc, final_path, batch_status
 
         if bf16_created_path and os.path.exists(bf16_created_path):
             os.remove(bf16_created_path)
             log_acc += "🧹 Cleaned up BF16 intermediate.\n"
 
-        log_acc += f"\n{'='*60}\n✨ BATCH TASKS FINISHED.\n"
-        yield log_acc, temp_path, "Process Finished"
+        log_acc += "\n✨ ALL TASKS FINISHED."
+        yield log_acc, temp_path, "Idle"
 
     except Exception as e:
-        log_acc += f"\n🔥 CRITICAL FAILURE: {str(e)}\n"
-        yield log_acc, "", "Critical Error"
+        yield log_acc + f"\n🔥 CRITICAL FAILURE: {str(e)}", "", "Error"
     finally:
-        # Logging and Cleanup...
         active_process = None
         torch.cuda.empty_cache()
 

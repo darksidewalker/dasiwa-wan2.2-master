@@ -103,36 +103,38 @@ class ActionMasterEngine:
                     if any(x in k for x in [".diff", ".alpha", ".bias", "_alpha", "_bias"]): return k, None, "vector"
         return None, None, None
 
-    def calculate_delta(self, lora_sd, up_k, down_k, weight, global_mult, target_key, recipe_density=1.0):
-        # 🛡️ ROUTER SHIELD (From our previous step)
+    def calculate_delta(self, lora_sd, up_k, down_k, weight, global_mult, target_key, method, recipe_density=1.0):
+        # 🛡️ ROUTER SHIELD: Protect the MoE brain (Gates/Routers)
         if self.router_regex.search(target_key):
-            return torch.zeros_like(self.base_dict[target_key]).to("cpu"), 0.0, False
+            return None, 0.0, False
 
         with torch.no_grad():
-            # 🚀 64GB BOOST: Use Pinned Memory for DMA Transfers
-            # We convert to float32 and 'pin' the memory so the GPU can pull it via DMA
-            up_f32 = lora_sd[up_k].to(torch.float32).pin_memory()
-            down_f32 = lora_sd[down_k].to(torch.float32).pin_memory()
-
-            # Move to CUDA (non_blocking=True is safe with pinned memory)
-            up = up_f32.to("cuda", non_blocking=True)
-            down = down_f32.to("cuda", non_blocking=True)
+            # 🚀 GPU Speed Up: Use Pinned Memory for fast DMA Transfer
+            up = lora_sd[up_k].to(torch.float32).pin_memory().to("cuda", non_blocking=True)
+            down = lora_sd[down_k].to(torch.float32).pin_memory().to("cuda", non_blocking=True)
             
-            # ⚡ GPU MATRIX MATH
+            # Base Delta Calculation
             delta = (up @ down) * (float(weight) * global_mult)
-            
-            # 🎯 TOP-K SPARSITY ON GPU
-            if recipe_density < 1.0:
-                flat_delta = delta.abs().view(-1)
-                k = int(flat_delta.numel() * recipe_density)
-                if k > 0:
-                    threshold = torch.topk(flat_delta, k).values[-1]
-                    delta = torch.where(delta.abs() >= threshold, delta, torch.zeros_like(delta))
-                    passed_pct = (k / flat_delta.numel()) * 100
-                else: passed_pct = 0.0
-            else: passed_pct = 100.0
 
-            # Move back to CPU (This is now the only slow part, but it's only 5% of the data)
+            # --- MODE SELECTION ---
+            if method == "INJECTION" and recipe_density < 1.0:
+                # 🧠 SMART LOGIC: Surgical MoE-DARE (Drop And Rescale)
+                # DARE succeeds where TIES fails because it doesn't require sign-consensus 
+                # across mismatched LoRA ranks.
+                flat_delta = delta.flatten()
+                k = int(flat_delta.numel() * (1.0 - recipe_density))
+                if k > 0:
+                    # Drop: Mask out the smallest values
+                    threshold = torch.topk(flat_delta.abs(), k, largest=False).values[-1]
+                    mask = delta.abs() > threshold
+                    # Rescale: Maintain expectation (1 / p) to keep knowledge intensity
+                    delta = torch.where(mask, delta / recipe_density, torch.zeros_like(delta))
+                passed_pct = recipe_density * 100
+            else:
+                # ⚗️ ADDITION MODE: Distillation Logic
+                # Ignores density, inserts 100% of LoRA weight as requested.
+                passed_pct = 100.0
+
             return delta.to("cpu"), passed_pct, True
 
     def process_pass(self, step, global_mult):
@@ -170,12 +172,10 @@ class ActionMasterEngine:
                 
                 match (k_type, dk):
                     case ("matrix", _):
-                        # 1. GPU-ACCELERATED CALCULATION
-                        # Returns 'hit=False' if the key triggered the Router Shield
                         delta, inj_val, hit = self.calculate_delta(
-                            lora_sd, k1, k2, f['weight'], global_mult, 
-                            target_key, recipe_density
-                        )
+                        lora_sd, k1, k2, f['weight'], global_mult, 
+                        target_key, method_label, recipe_density
+                    )
                         
                         # 2. APPLY ONLY IF NOT SHIELDED
                         if hit:
@@ -235,34 +235,38 @@ class ActionMasterEngine:
         yield f"  ✅ {pass_name} Complete. Global Shift: {shift:.8f}"
 
     def apply_delta(self, target_key, delta):
+        if delta is None: return False
         base = self.base_dict[target_key]
         
-        # 1. STRUCTURAL VALIDATION
+        # Structural Validation
         if base.ndim > 2 and delta.ndim <= 2: return False
-        if delta.numel() == base.numel(): 
-            delta = delta.reshape(base.shape)
-        elif delta.ndim == 2 and delta.t().shape == base.shape: 
-            delta = delta.t()
-        else: 
-            return False
+        if delta.numel() == base.numel(): delta = delta.reshape(base.shape)
+        elif delta.ndim == 2 and delta.t().shape == base.shape: delta = delta.t()
+        else: return False
 
         with torch.no_grad():
-            # 2. MATCH PRECISION
-            # 14B models love bfloat16 for stability. 
-            # We do the addition in float32 for accuracy, then clamp.
-            cpu_delta = delta.to("cpu", dtype=torch.float32)
+            cpu_delta = delta.to(torch.float32)
             base_f32 = base.to(torch.float32)
             
-            # 3. THE "STABILITY" ADDITION
+            # --- THE "VIDEO KILL" CURE: Norm Preservation ---
+            # We measure the original "Energy" of the expert layer.
+            orig_norm = torch.norm(base_f32)
+            
+            # Perform the addition
             updated_weight = base_f32 + cpu_delta
             
-            # 4. OVERFLOW SHIELD (Crucial for WAN 2.2)
-            # Prevents weights from spiraling out of control
+            # 🎯 Re-scale back to original Norm
+            # This allows the "Knowledge" from the LoRA to be added, but prevents
+            # the activation drift that confuses the MoE Routers.
+            new_norm = torch.norm(updated_weight)
+            if new_norm > 0:
+                updated_weight = updated_weight * (orig_norm / new_norm)
+            
+            # Expert Stability Guard (5-Sigma Clamp)
             std, mean = torch.std_mean(base_f32)
-            limit = mean + (std * 5) # Stay within 5 standard deviations
+            limit = mean + (std * 5)
             updated_weight = torch.clamp(updated_weight, -limit, limit)
             
-            # 5. CAST BACK
             self.base_dict[target_key] = updated_weight.to(base.dtype)
             
         return True
