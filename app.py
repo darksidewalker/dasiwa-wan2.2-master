@@ -41,7 +41,6 @@ def stop_pipeline():
     return "🛑 CONVERSION TERMINATED\n" + "-"*60, "Idle"
 
 def update_metadata_preview(name):
-    """Updates the JSON Code box in real-time as the user types."""
     curr_date = datetime.datetime.now().strftime("%Y-%m-%d")
     preview = {}
     for k, v in METADATA_TEMPLATE.items():
@@ -210,6 +209,7 @@ with gr.Blocks(title="Conversion Station") as demo:
             with gr.Group():
                 gr.Markdown("### 📝 Metadata Injector & Live Preview")
                 metadata_input = gr.Code(
+                    value=update_metadata_preview("Enter Name..."), 
                     language="json",
                     label="Current Metadata Header (Live Preview)",
                     interactive=True
@@ -221,6 +221,7 @@ with gr.Blocks(title="Conversion Station") as demo:
     # --- BINDINGS ---
     # Initialization
     demo.load(list_files, outputs=[base_dd])
+    demo.load(lambda: update_metadata_preview(""), outputs=[metadata_input])
     refresh_btn.click(list_files, outputs=[base_dd])
     
     # Real-time JSON Preview as you type the model name

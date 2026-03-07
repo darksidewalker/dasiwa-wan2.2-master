@@ -15,8 +15,8 @@ def get_sys_info():
             res = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"], encoding='utf-8')
             gpu_load = f"{res.strip()}%"
         except: gpu_load = "ERR%"
-    return f"🖥️ CPU: {cpu}% | RAM: {ram}%\\n📟 GPU: {gpu_load} | VRAM: {vram_info}"
-
+    return f"🖥️ CPU: {cpu:>3}% | RAM: {ram:>3}%\n📟 GPU: {gpu_load:>3} | VRAM: {vram_info}"
+    
 def inject_metadata(file_path, metadata_dict):
     """
     Overwrites the safetensors file with new metadata.
