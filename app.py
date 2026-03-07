@@ -190,7 +190,7 @@ with gr.Blocks(title="Conversion Station") as demo:
                     ],
                     label="Target Format",
                     info="Choose precision level. GGUF requires a multi-step build.",
-                    value=["Standard FP8 (ComfyUI)"]
+                    value=["FP8"]
                 )
 
         # Column 3: Optimizations & Vitals
