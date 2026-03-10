@@ -8,11 +8,9 @@ from config import MODELS_DIR
 from utils.scanner_5d import scan_5d_tensors
 from utils.file_ops import get_full_path
 
-def setup_callbacks(
-    base_dd, friendly_name, refresh_btn, run_btn, stop_btn, 
-    q_format, pipeline_status, extra_flags, terminal_box, 
-    metadata_input, inject_btn, read_btn
-):
+def setup_callbacks(base_dd, friendly_name, refresh_btn, run_btn, stop_btn, 
+                   q_format, pipeline_status, extra_flags, terminal_box, 
+                   metadata_input, inject_btn, read_btn, scan_btn):
     # --- 1. Model List Management ---
     refresh_btn.click(fn=list_files, outputs=[base_dd])
 
@@ -26,7 +24,7 @@ def setup_callbacks(
     def handle_scan(file_name):
         if not file_name:
             return "❌ No model selected for scanning."
-        # Resolve the full path using MODELS_DIR
+        from utils.file_ops import get_full_path
         full_path = get_full_path(file_name)
         return scan_5d_tensors(full_path)
 

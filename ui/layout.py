@@ -69,9 +69,10 @@ def create_ui():
 
         # Logic Wiring
         setup_callbacks(
-            base_dd, friendly_name, refresh_btn, run_btn, stop_btn, 
-            q_format, pipeline_status, extra_flags, terminal_box, 
-            metadata_input, inject_btn, read_btn
+        base_dd, friendly_name, refresh_btn, run_btn, stop_btn, 
+        q_format, pipeline_status, extra_flags, terminal_box, 
+        metadata_input, inject_btn, read_btn, 
+        scan_btn
         )
 
         # 🚀 INITIALIZATION: Scan folder on startup
