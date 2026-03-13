@@ -4,6 +4,7 @@ import gguf
 import torch
 import logging
 import argparse
+import hashlib
 from tqdm import tqdm
 from safetensors.torch import load_file, save_file
 
@@ -13,14 +14,14 @@ MAX_TENSOR_NAME_LENGTH = 127
 MAX_TENSOR_DIMS = 4
 
 class ModelTemplate:
-    arch = "invalid"  # string describing architecture
-    shape_fix = False # whether to reshape tensors
-    keys_detect = []  # list of lists to match in state dict
-    keys_banned = []  # list of keys that should mark model as invalid for conversion
-    keys_hiprec = []  # list of keys that need to be kept in fp32 for some reason
-    keys_ignore = []  # list of strings to ignore keys by when found
+    arch = "invalid"
+    shape_fix = False 
+    keys_detect = []  
+    keys_banned = []  
+    keys_hiprec = []  
+    keys_ignore = []  
 
-    def handle_nd_tensor(self, key, data):
+    def handle_nd_tensor(self, key, data, src_path=None):
         raise NotImplementedError(f"Tensor detected that exceeds dims supported by C++ code! ({key} @ {data.shape})")
 
 class ModelFlux(ModelTemplate):
@@ -88,9 +89,7 @@ class ModelHyVid(ModelTemplate):
         else:
             path = f"./fix_5d_tensors_{self.arch}.safetensors"
 
-        if os.path.isfile(path):
-            tqdm.write(f"⚠️ Note: 5D fix file already exists, overwriting: {path}")
-        
+        # Note: We overwrite instead of aborting to allow for re-runs
         fsd = {key: torch.from_numpy(data)}
         tqdm.write(f"🎯 5D key found! Saving unique fix file: {path}")
         save_file(fsd, path)
@@ -98,15 +97,9 @@ class ModelHyVid(ModelTemplate):
 class ModelWan(ModelHyVid):
     arch = "wan"
     keys_detect = [
-        (
-            "blocks.0.self_attn.norm_q.weight",
-            "text_embedding.2.weight",
-            "head.modulation",
-        )
+        ("blocks.0.self_attn.norm_q.weight", "text_embedding.2.weight", "head.modulation",)
     ]
-    keys_hiprec = [
-        ".modulation" # nn.parameter, can't load from BF16 ver
-    ]
+    keys_hiprec = [".modulation"]
 
 class ModelLTXV(ModelTemplate):
     arch = "ltxv"
@@ -222,14 +215,11 @@ def load_state_dict(path):
             if subkey in state_dict:
                 state_dict = state_dict[subkey]
                 break
-        if len(state_dict) < 20:
-            raise RuntimeError(f"pt subkey load failed: {state_dict.keys()}")
     else:
         state_dict = load_file(path)
-
     return strip_prefix(state_dict)
 
-def handle_tensors(writer, state_dict, model_arch):
+def handle_tensors(writer, state_dict, model_arch, src_path=None):
     name_lengths = tuple(sorted(
         ((key, len(key)) for key in state_dict.keys()),
         key=lambda item: item[1],
@@ -237,20 +227,16 @@ def handle_tensors(writer, state_dict, model_arch):
     ))
     if not name_lengths:
         return
+    
     max_name_len = name_lengths[0][1]
-    if max_name_len > MAX_TENSOR_NAME_LENGTH:
-        bad_list = ", ".join(f"{key!r} ({namelen})" for key, namelen in name_lengths if namelen > MAX_TENSOR_NAME_LENGTH)
-        raise ValueError(f"Can only handle tensor names up to {MAX_TENSOR_NAME_LENGTH} characters. Tensors exceeding the limit: {bad_list}")
     for key, data in tqdm(state_dict.items()):
         old_dtype = data.dtype
 
         if any(x in key for x in model_arch.keys_ignore):
-            tqdm.write(f"Filtering ignored key: '{key}'")
             continue
 
         if data.dtype == torch.bfloat16:
             data = data.to(torch.float32).numpy()
-        # this is so we don't break torch 2.0.X
         elif data.dtype in [getattr(torch, "float8_e4m3fn", "_invalid"), getattr(torch, "float8_e5m2", "_invalid")]:
             data = data.to(torch.float16).numpy()
         else:
@@ -258,113 +244,69 @@ def handle_tensors(writer, state_dict, model_arch):
 
         n_dims = len(data.shape)
         data_shape = data.shape
-        if old_dtype == torch.bfloat16:
-            data_qtype = gguf.GGMLQuantizationType.BF16
-        # elif old_dtype == torch.float32:
-        #     data_qtype = gguf.GGMLQuantizationType.F32
-        else:
-            data_qtype = gguf.GGMLQuantizationType.F16
+        data_qtype = gguf.GGMLQuantizationType.BF16 if old_dtype == torch.bfloat16 else gguf.GGMLQuantizationType.F16
 
-        # The max no. of dimensions that can be handled by the quantization code is 4
         if len(data.shape) > MAX_TENSOR_DIMS:
-            model_arch.handle_nd_tensor(key, data)
-            continue # needs to be added back later
+            model_arch.handle_nd_tensor(key, data, src_path=src_path)
+            continue 
 
-        # get number of parameters (AKA elements) in this tensor
-        n_params = 1
-        for dim_size in data_shape:
-            n_params *= dim_size
-
+        n_params = data.size
         if old_dtype in (torch.float32, torch.bfloat16):
-            if n_dims == 1:
-                # one-dimensional tensors should be kept in F32
-                # also speeds up inference due to not dequantizing
+            if n_dims == 1 or n_params <= QUANTIZATION_THRESHOLD or any(x in key for x in model_arch.keys_hiprec):
                 data_qtype = gguf.GGMLQuantizationType.F32
 
-            elif n_params <= QUANTIZATION_THRESHOLD:
-                # very small tensors
-                data_qtype = gguf.GGMLQuantizationType.F32
-
-            elif any(x in key for x in model_arch.keys_hiprec):
-                # tensors that require max precision
-                data_qtype = gguf.GGMLQuantizationType.F32
-
-        if (model_arch.shape_fix                        # NEVER reshape for models such as flux
-            and n_dims > 1                              # Skip one-dimensional tensors
-            and n_params >= REARRANGE_THRESHOLD         # Only rearrange tensors meeting the size requirement
-            and (n_params / 256).is_integer()           # Rearranging only makes sense if total elements is divisible by 256
-            and not (data.shape[-1] / 256).is_integer() # Only need to rearrange if the last dimension is not divisible by 256
-        ):
+        if (model_arch.shape_fix and n_dims > 1 and n_params >= REARRANGE_THRESHOLD 
+            and (n_params / 256).is_integer() and not (data.shape[-1] / 256).is_integer()):
             orig_shape = data.shape
             data = data.reshape(n_params // 256, 256)
             writer.add_array(f"comfy.gguf.orig_shape.{key}", tuple(int(dim) for dim in orig_shape))
 
         try:
             data = gguf.quants.quantize(data, data_qtype)
-        except (AttributeError, gguf.QuantError) as e:
-            tqdm.write(f"falling back to F16: {e}")
+        except (AttributeError, gguf.QuantError):
             data_qtype = gguf.GGMLQuantizationType.F16
             data = gguf.quants.quantize(data, data_qtype)
 
-        new_name = key # do we need to rename?
-
         shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
-        tqdm.write(f"{f'%-{max_name_len + 4}s' % f'{new_name}'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
-
-        writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+        tqdm.write(f"{f'%-{max_name_len + 4}s' % key} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
+        writer.add_tensor(key, data, raw_dtype=data_qtype)
 
 def convert_file(path, dst_path=None, interact=True, overwrite=False):
-    # load & run model detection logic
     state_dict = load_state_dict(path)
     model_arch = detect_arch(state_dict)
-    logging.info(f"* Architecture detected from input: {model_arch.arch}")
-
-    # detect & set dtype for output file
+    
     dtypes = [x.dtype for x in state_dict.values()]
-    dtypes = {x:dtypes.count(x) for x in set(dtypes)}
-    main_dtype = max(dtypes, key=dtypes.get)
-
-    if main_dtype == torch.bfloat16:
-        ftype_name = "BF16"
-        ftype_gguf = gguf.LlamaFileType.MOSTLY_BF16
-    # elif main_dtype == torch.float32:
-    #     ftype_name = "F32"
-    #     ftype_gguf = None
-    else:
-        ftype_name = "F16"
-        ftype_gguf = gguf.LlamaFileType.MOSTLY_F16
+    main_dtype = max(set(dtypes), key=dtypes.count)
+    ftype_name = "BF16" if main_dtype == torch.bfloat16 else "F16"
+    ftype_gguf = gguf.LlamaFileType.MOSTLY_BF16 if main_dtype == torch.bfloat16 else gguf.LlamaFileType.MOSTLY_F16
 
     if dst_path is None:
         dst_path = f"{os.path.splitext(path)[0]}-{ftype_name}.gguf"
-    elif "{ftype}" in dst_path: # lcpp logic
-        dst_path = dst_path.replace("{ftype}", ftype_name)
 
     if os.path.isfile(dst_path) and not overwrite:
-        if interact:
-            input("Output exists enter to continue or ctrl+c to abort!")
-        else:
-            raise OSError("Output exists and overwriting is disabled!")
+        if not interact: raise OSError("Output exists!")
+        input("Output exists enter to continue...")
 
-    # handle actual file
     writer = gguf.GGUFWriter(path=None, arch=model_arch.arch)
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
     if ftype_gguf is not None:
         writer.add_file_type(ftype_gguf)
 
-    handle_tensors(writer, state_dict, model_arch)
+    handle_tensors(writer, state_dict, model_arch, src_path=path)
+    
     writer.write_header_to_file(path=dst_path)
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
     writer.close()
 
-    fix = f"./fix_5d_tensors_{model_arch.arch}.safetensors"
+    file_hash = hashlib.md5(os.path.basename(path).encode()).hexdigest()[:8]
+    fix = f"./fix_5d_tensors_{model_arch.arch}_{file_hash}.safetensors"
     if os.path.isfile(fix):
-        logging.warning(f"\n### Warning! Fix file found at '{fix}'")
-        logging.warning(" you most likely need to run 'fix_5d_tensors.py' after quantization.")
+        logging.warning(f"\n### Success! Unique fix file created at '{fix}'")
+        logging.warning(" The UI engine will now use this file for the 5D Tensor Fix step.")
 
     return dst_path, model_arch
 
 if __name__ == "__main__":
     args = parse_args()
     convert_file(args.src, args.dst)
-
