@@ -9,6 +9,29 @@ PATCH_FILE="$PROJECT_DIR/lcpp.patch"
 
 echo "📂 Project Root: $PROJECT_DIR"
 
+# --- 1.5 MULTI-DISTRO DEPENDENCIES ---
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    echo "🔍 Detected System: $NAME"
+
+    case "$ID" in
+        arch|manjaro)
+            echo "📦 Installing for Arch-based system..."
+            sudo pacman -S --needed --noconfirm base-devel cmake cuda
+            ;;
+        ubuntu|debian|mint)
+            echo "📦 Installing for Debian-based system..."
+            sudo apt update
+            sudo apt install -y build-essential cmake nvidia-cuda-toolkit
+            ;;
+        *)
+            echo "⚠️ Unrecognized distribution ($ID). Please install build-essential, cmake, and cuda manually."
+            ;;
+    esac
+else
+    echo "❌ Could not detect OS via /etc/os-release. Skipping system package install."
+fi
+
 # --- 2. CLONE, PATCH & BUILD LLAMA.CPP (SKIP IF DONE) ---
 cd "$PROJECT_DIR"
 
@@ -26,7 +49,7 @@ else
     fi
 
     cd "$LLAMA_DIR"
-    
+
     # 2. Hard Reset and Patch (Only if we are actually building)
     echo "🏷️ Preparing source for Wan 2.2..."
     git reset --hard
