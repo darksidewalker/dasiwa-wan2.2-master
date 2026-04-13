@@ -1,12 +1,12 @@
-# 🌀 DaSiWa WAN 2.2 Master: Quantizer (WIP)
+# 🌀 DaSiWa Quant Station
 
-DaSiWa WAN 2.2 Master is a high-performance toolkit designed for quantizing Wan 2.2 (14B) Video Models. Specifically engineered for systems with 64GB RAM and NVIDIA Ada (40-series) or Blackwell (50-series) GPUs.
+DaSiWa Quant Station is a high-performance toolkit designed for quantizing Video Models. Specifically engineered for systems with 64GB RAM and NVIDIA Ada (40-series) or Blackwell (50-series) GPUs.
 
 📦 GGUF MoE Specialist: Native Wan 2.2 GGUF quantization with Self-Healing 5D Expert Injection to preserve video tensor shapes and prevent "gray-screen" outputs.
 
 💎 Next-Gen FP Quants: Native support for NVFP4 (Blackwell) and FP8 E4M3 (Ada) via optimized convert_to_quant integration.
 
-🛡️ 64GB Safety Logic: Intelligent memory flushing and subprocess monitoring to prevent OOM (Out of Memory) crashes during 14B model handling.
+🛡️ 64GB Safety Logic: Intelligent memory flushing and subprocess monitoring to prevent OOM (Out of Memory) crashes during model handling.
 
 ## 🚀 Quick Start
 
@@ -20,11 +20,11 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### Installation & Launch
 
-The included start.sh environment syncing, and build requirements automatically.
+The included start-linux.sh environment syncing, and build requirements automatically.
 Bash
 ```
-chmod +x start.sh
-./start.sh
+chmod +x start-linux.sh
+./start-linux.sh
 ```
 
 #### 🛠️ Quantization Guide
