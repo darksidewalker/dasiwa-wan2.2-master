@@ -24,7 +24,7 @@ MODEL_METADATA_CONFIGS = {
 
 COMMON_METADATA = {
     "modelspec.date": "{date}",
-    "quantization.tool": "https://github.com/darksidewalker/dasiwa-wan2.2-master",
+    "quantization.tool": "https://github.com/darksidewalker/dasiwa-quant-station",
     "quantization.bits": "{bits}"
 }
 
